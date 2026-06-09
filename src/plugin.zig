@@ -54,12 +54,29 @@ fn runLlvm2SaCommand(ctx: *const plugin_api.Context, argv: []const []const u8, s
     if (argv.len < 3) return error.MissingSourcePath;
     if (argv.len > 3) return error.UnexpectedArgument;
     const translated = bc2sa.translateBitcodeFile(ctx.allocator, argv[2]) catch |err| {
-        try stderr.print("error: {s}\n", .{@errorName(err)});
+        try writeTranslateError(stderr, err);
         return 1;
     };
     defer ctx.allocator.free(translated);
     try stdout.writeAll(translated);
     return 0;
+}
+
+fn writeTranslateError(writer: std.io.AnyWriter, err: anyerror) !void {
+    const detail = switch (err) {
+        error.StaticMemoryOverflow => .{
+            .code = "SA-CLI-019",
+            .message = "static memory overflow detected in LLVM bitcode",
+            .hint = "reduce the constant GEP/index offset or widen the fixed-size array before translating",
+        },
+        else => {
+            try writer.print("error: {s}\n", .{@errorName(err)});
+            return;
+        },
+    };
+
+    try writer.print("error[{s}]: {s}\n", .{ detail.code, detail.message });
+    try writer.print("  help: {s}\n", .{detail.hint});
 }
 
 fn isBc2SaCliError(err: anyerror) bool {
@@ -174,4 +191,16 @@ test "bc2sa plugin abi maps missing input to cli diagnostic" {
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buf.items, 1, "error[SA-BC2SA-CLI]: missing required bitcode input"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buf.items, 1, "usage: sa bc2sa <file.bc>"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, stderr_buf.items, 1, "PluginFailed"));
+}
+
+test "bc2sa plugin formats static memory overflow diagnostic" {
+    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer stderr_buf.deinit();
+    var capture_ctx = CaptureCtx{ .buffer = &stderr_buf };
+    var stderr_ctx = StreamCtx{ .stream = makeCaptureStream(&capture_ctx) };
+    const stderr_writer = std.io.AnyWriter{ .context = &stderr_ctx, .writeFn = writeAll };
+
+    try writeTranslateError(stderr_writer, error.StaticMemoryOverflow);
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buf.items, 1, "error[SA-CLI-019]: static memory overflow detected in LLVM bitcode"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buf.items, 1, "reduce the constant GEP/index offset or widen the fixed-size array before translating"));
 }

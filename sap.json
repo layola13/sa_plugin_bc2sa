@@ -22,8 +22,16 @@
       { "op": "read", "path": "$PROJECT/**" }
     ],
     "net": [],
-    "env": [],
-    "process": { "spawn": false, "exec": [] }
+    "env": ["HOME", "SA_*"],
+    "process": {
+      "spawn": true,
+      "exec": [
+        {
+          "path": "/usr/bin/llvm-dis-14",
+          "args": ["-o", "-", "*"]
+        }
+      ]
+    }
   },
   "dependencies": {}
 }
