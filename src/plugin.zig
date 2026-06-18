@@ -119,6 +119,9 @@ fn writeBc2SaCliError(writer: std.io.AnyWriter, err: anyerror) !void {
 
 fn runLlvm2SaCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*:0]const u8, argv_len: usize, stdout: plugin_api.HostStream, stderr: plugin_api.HostStream, out_code: *u8) callconv(.c) u32 {
     out_code.* = 0;
+    if (argv_len < 2) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
+    if (!std.mem.eql(u8, std.mem.span(argv[1]), "bc2sa")) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
+
     var stdout_ctx = StreamCtx{ .stream = stdout };
     var stderr_ctx = StreamCtx{ .stream = stderr };
     const stdout_writer = std.io.AnyWriter{ .context = &stdout_ctx, .writeFn = writeAll };
