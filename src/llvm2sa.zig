@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const TranslateError = error{
     OutOfMemory,
@@ -14,7 +15,8 @@ pub const TranslateError = error{
 const bitcode_magic = [_]u8{ 'B', 'C', 0xc0, 0xde };
 const max_bitcode_bytes = 64 * 1024 * 1024;
 const max_ir_bytes = 64 * 1024 * 1024;
-const llvm_dis_path = "/usr/bin/llvm-dis-14";
+const llvm_dis_candidates = if (builtin.os.tag == .windows) [_][]const u8{ "llvm-dis-14.exe", "llvm-dis.exe", "llvm-dis-14" } else [_][]const u8{ "/usr/bin/llvm-dis-14", "llvm-dis-14", "llvm-dis" };
+const llvm_as_candidates = if (builtin.os.tag == .windows) [_][]const u8{ "llvm-as-14.exe", "llvm-as.exe", "llvm-as-14" } else [_][]const u8{ "llvm-as-14", "llvm-as" };
 
 fn trim(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
@@ -833,7 +835,9 @@ fn runLlvmDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u
 }
 
 fn disassembleBitcode(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (try runLlvmDisTool(allocator, llvm_dis_path, path)) |ir| return ir;
+    for (llvm_dis_candidates) |candidate| {
+        if (try runLlvmDisTool(allocator, candidate, path)) |ir| return ir;
+    }
     return error.LlvmDisNotFound;
 }
 
@@ -854,22 +858,24 @@ pub fn translateBitcodeFile(allocator: std.mem.Allocator, path: []const u8) ![]u
 }
 
 fn llvmAs(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
-    const argv = [_][]const u8{ "llvm-as-14", input_path, "-o", output_path };
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv[0..],
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.SkipZigTest,
-        else => return error.SkipZigTest,
+    for (llvm_as_candidates) |candidate| {
+        const argv = [_][]const u8{ candidate, input_path, "-o", output_path };
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = argv[0..],
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .Exited => |code| if (code == 0) return,
+            else => {},
+        }
     }
+    return error.SkipZigTest;
 }
-
 test "bc2sa translates real llvm bitcode" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

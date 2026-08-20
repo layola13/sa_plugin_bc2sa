@@ -31,23 +31,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(b.getInstallStep());
 
-    const smoke_home = b.option([]const u8, "smoke-home", "SA_PLUGINS_HOME used by the bc2sa install smoke step.") orelse b.pathJoin(&.{ ".zig-cache", "bc2sa-install-smoke-home" });
-    const install_smoke_step = b.step("install-smoke", "Install bc2sa into an isolated plugin home and verify the installed command.");
+    if (target.result.os.tag != .windows) {
+        const smoke_home = b.option([]const u8, "smoke-home", "SA_PLUGINS_HOME used by the bc2sa install smoke step.") orelse b.pathJoin(&.{ ".zig-cache", "bc2sa-install-smoke-home" });
+        const install_smoke_step = b.step("install-smoke", "Install bc2sa into an isolated plugin home and verify the installed command.");
 
-    const install_smoke = b.addSystemCommand(&.{ sa_bin, "plugin", "install", "--dev", "." });
-    install_smoke.setEnvironmentVariable("SA_PLUGINS_HOME", smoke_home);
-    install_smoke.setEnvironmentVariable("SA_PLUGIN_DEV", "1");
-    install_smoke.addFileInput(b.path("sap.json"));
-    install_smoke.addFileInput(lib.getEmittedBin());
-    install_smoke.step.dependOn(b.getInstallStep());
-    install_smoke_step.dependOn(&install_smoke.step);
+        const install_smoke = b.addSystemCommand(&.{ sa_bin, "plugin", "install", "--dev", "." });
+        install_smoke.setEnvironmentVariable("SA_PLUGINS_HOME", smoke_home);
+        install_smoke.setEnvironmentVariable("SA_PLUGIN_DEV", "1");
+        install_smoke.addFileInput(b.path("sap.json"));
+        install_smoke.addFileInput(lib.getEmittedBin());
+        install_smoke.step.dependOn(b.getInstallStep());
+        install_smoke_step.dependOn(&install_smoke.step);
 
-    const verify_install = b.addSystemCommand(&.{ "bash", "tests/install_smoke.sh", smoke_home, sa_bin });
-    verify_install.addFileInput(b.path("tests/install_smoke.sh"));
-    verify_install.addFileInput(b.path("tests/install_smoke.ll"));
-    verify_install.addFileInput(b.path("sap.json"));
-    verify_install.addFileInput(lib.getEmittedBin());
-    verify_install.step.dependOn(&install_smoke.step);
-    install_smoke_step.dependOn(&verify_install.step);
-    test_step.dependOn(&verify_install.step);
+        const verify_install = b.addSystemCommand(&.{ "bash", "tests/install_smoke.sh", smoke_home, sa_bin });
+        verify_install.addFileInput(b.path("tests/install_smoke.sh"));
+        verify_install.addFileInput(b.path("tests/install_smoke.ll"));
+        verify_install.addFileInput(b.path("sap.json"));
+        verify_install.addFileInput(lib.getEmittedBin());
+        verify_install.step.dependOn(&install_smoke.step);
+        install_smoke_step.dependOn(&verify_install.step);
+        test_step.dependOn(&verify_install.step);
+    }
 }
