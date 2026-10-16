@@ -8,13 +8,18 @@ pub const TranslateError = error{
     LlvmDisNotFound,
     UnsupportedBitcodeInput,
     UnsupportedInstruction,
+    UnsupportedPhi,
     StaticMemoryOverflow,
 };
 
 const bitcode_magic = [_]u8{ 'B', 'C', 0xc0, 0xde };
 const max_bitcode_bytes = 64 * 1024 * 1024;
 const max_ir_bytes = 64 * 1024 * 1024;
-const llvm_dis_path = "/usr/bin/llvm-dis-14";
+// NOTE: multi-version candidates, newest first. `sap.json` process whitelist
+// must stay in sync when this list changes.
+const llvm_dis_candidates = [_][]const u8{ "/usr/bin/llvm-dis-17", "/usr/bin/llvm-dis-16", "/usr/bin/llvm-dis-15", "/usr/bin/llvm-dis-14", "llvm-dis-17", "llvm-dis-16", "llvm-dis-15", "llvm-dis-14", "llvm-dis" };
+const clang_candidates = [_][]const u8{ "/usr/bin/clang", "clang" };
+const llvm_as_candidates = [_][]const u8{ "llvm-as-17", "llvm-as-16", "llvm-as-15", "llvm-as-14", "llvm-as" };
 
 /// NOTE(Zig 0.17): ambient filesystem/subprocess access was removed; every
 /// fs/process op needs an explicit `Io`. Lazily created once per process.
@@ -620,6 +625,352 @@ fn appendCast(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
     try listPrint(out, " as {s}\n", .{dest_ty});
 }
 
+fn llvmFloatOpToSa(op: []const u8) ?[]const u8 {
+    inline for ([_]struct { llvm: []const u8, sa: []const u8 }{
+        .{ .llvm = "fadd", .sa = "fadd" },
+        .{ .llvm = "fsub", .sa = "fsub" },
+        .{ .llvm = "fmul", .sa = "fmul" },
+        .{ .llvm = "fdiv", .sa = "fdiv" },
+    }) |item| {
+        if (std.mem.eql(u8, op, item.llvm)) return item.sa;
+    }
+    return null;
+}
+
+fn llvmFcmpToSa(pred: []const u8) ?[]const u8 {
+    // Ordered and unordered variants collapse onto the same SA fcmp op;
+    // NaN semantics stay conservative: anything unordered-flavored that SA
+    // cannot express (ord/uno) is rejected instead of miscompiled.
+    inline for ([_]struct { llvm: []const u8, sa: []const u8 }{
+        .{ .llvm = "oeq", .sa = "fcmp_eq" },
+        .{ .llvm = "ueq", .sa = "fcmp_eq" },
+        .{ .llvm = "one", .sa = "fcmp_ne" },
+        .{ .llvm = "une", .sa = "fcmp_ne" },
+        .{ .llvm = "olt", .sa = "fcmp_lt" },
+        .{ .llvm = "ult", .sa = "fcmp_lt" },
+        .{ .llvm = "ole", .sa = "fcmp_le" },
+        .{ .llvm = "ule", .sa = "fcmp_le" },
+        .{ .llvm = "ogt", .sa = "fcmp_gt" },
+        .{ .llvm = "ugt", .sa = "fcmp_gt" },
+        .{ .llvm = "oge", .sa = "fcmp_ge" },
+        .{ .llvm = "uge", .sa = "fcmp_ge" },
+    }) |item| {
+        if (std.mem.eql(u8, pred, item.llvm)) return item.sa;
+    }
+    return null;
+}
+
+fn appendFloatOp(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, op: []const u8, rest: []const u8) !void {
+    const sa_op = llvmFloatOpToSa(op) orelse return error.UnsupportedInstruction;
+    const ty_token = firstTypeToken(rest) orelse return error.UnsupportedInstruction;
+    const sa_ty = typeTokenToSa(ty_token) orelse return error.UnsupportedInstruction;
+    if (!std.mem.eql(u8, sa_ty, "f32") and !std.mem.eql(u8, sa_ty, "f64")) return error.UnsupportedInstruction;
+    const after_ty = trim(rest[(std.mem.indexOf(u8, rest, ty_token) orelse 0) + ty_token.len ..]);
+    const args = try splitTopLevelComma(allocator, after_ty);
+    defer allocator.free(args);
+    if (args.len != 2) return error.UnsupportedInstruction;
+
+    const dst = try sanitizeIdent(allocator, lhs, "r");
+    defer allocator.free(dst);
+    try listPrint(out, "  {s} = {s} ", .{ dst, sa_op });
+    try appendValue(out, allocator, args[0]);
+    try out.appendSlice(", ");
+    try appendValue(out, allocator, args[1]);
+    try out.append('\n');
+}
+
+fn appendFcmp(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8) !void {
+    var parts = std.mem.tokenizeAny(u8, rest, " \t\r\n");
+    const pred = parts.next() orelse return error.InvalidIr;
+    const sa_op = llvmFcmpToSa(pred) orelse return error.UnsupportedInstruction;
+    const ty_token = parts.next() orelse return error.UnsupportedInstruction;
+    const sa_ty = typeTokenToSa(ty_token) orelse return error.UnsupportedInstruction;
+    if (!std.mem.eql(u8, sa_ty, "f32") and !std.mem.eql(u8, sa_ty, "f64")) return error.UnsupportedInstruction;
+    const after_ty_start = std.mem.indexOf(u8, rest, ty_token) orelse return error.InvalidIr;
+    const args_text = trim(rest[after_ty_start + ty_token.len ..]);
+    const args = try splitTopLevelComma(allocator, args_text);
+    defer allocator.free(args);
+    if (args.len != 2) return error.UnsupportedInstruction;
+
+    const dst = try sanitizeIdent(allocator, lhs, "r");
+    defer allocator.free(dst);
+    try listPrint(out, "  {s} = {s} ", .{ dst, sa_op });
+    try appendValue(out, allocator, args[0]);
+    try out.appendSlice(", ");
+    try appendValue(out, allocator, args[1]);
+    try out.append('\n');
+}
+
+fn appendSelect(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8) !void {
+    const args = try splitTopLevelComma(allocator, rest);
+    defer allocator.free(args);
+    if (args.len != 3) return error.UnsupportedInstruction;
+
+    const cond_ty = firstTypeToken(args[0]) orelse return error.UnsupportedInstruction;
+    if (!std.mem.eql(u8, typeTokenToSa(cond_ty) orelse return error.UnsupportedInstruction, "i1")) {
+        return error.UnsupportedInstruction;
+    }
+
+    const true_ty = firstTypeToken(args[1]) orelse return error.UnsupportedInstruction;
+    const false_ty = firstTypeToken(args[2]) orelse return error.UnsupportedInstruction;
+    const sa_ty = typeTokenToSa(true_ty) orelse return error.UnsupportedInstruction;
+    if (!std.mem.eql(u8, sa_ty, typeTokenToSa(false_ty) orelse return error.UnsupportedInstruction)) {
+        return error.UnsupportedInstruction;
+    }
+    const size = typeBytes(true_ty) orelse return error.UnsupportedInstruction;
+
+    const dst = try sanitizeIdent(allocator, lhs, "r");
+    defer allocator.free(dst);
+    const slot = try std.fmt.allocPrint(allocator, "bc2sa_select_slot_{s}", .{dst});
+    defer allocator.free(slot);
+    const true_label = try std.fmt.allocPrint(allocator, "L_BC2SA_SELECT_TRUE_{s}", .{dst});
+    defer allocator.free(true_label);
+    const false_label = try std.fmt.allocPrint(allocator, "L_BC2SA_SELECT_FALSE_{s}", .{dst});
+    defer allocator.free(false_label);
+    const join_label = try std.fmt.allocPrint(allocator, "L_BC2SA_SELECT_JOIN_{s}", .{dst});
+    defer allocator.free(join_label);
+
+    try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
+    try out.appendSlice("  br ");
+    try appendValue(out, allocator, args[0]);
+    try listPrint(out, " -> {s}, {s}\n", .{ true_label, false_label });
+
+    try listPrint(out, "{s}:\n", .{true_label});
+    try listPrint(out, "  store {s}+0, ", .{slot});
+    try appendValue(out, allocator, args[1]);
+    try listPrint(out, " as {s}\n", .{sa_ty});
+    try listPrint(out, "  jmp {s}\n", .{join_label});
+
+    try listPrint(out, "{s}:\n", .{false_label});
+    try listPrint(out, "  store {s}+0, ", .{slot});
+    try appendValue(out, allocator, args[2]);
+    try listPrint(out, " as {s}\n", .{sa_ty});
+    try listPrint(out, "  jmp {s}\n", .{join_label});
+
+    try listPrint(out, "{s}:\n", .{join_label});
+    try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ dst, slot, sa_ty });
+}
+
+fn appendSwitch(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, text: []const u8, switch_id: usize) !void {
+    const open = std.mem.indexOfScalar(u8, text, '[') orelse return error.UnsupportedInstruction;
+    const close = std.mem.lastIndexOfScalar(u8, text, ']') orelse return error.InvalidIr;
+    if (close < open) return error.InvalidIr;
+
+    const header = try splitTopLevelComma(allocator, trim(text["switch".len..open]));
+    defer allocator.free(header);
+    if (header.len != 2) return error.UnsupportedInstruction;
+    const switch_ty = firstTypeToken(header[0]) orelse return error.UnsupportedInstruction;
+    const sa_ty = typeTokenToSa(switch_ty) orelse return error.UnsupportedInstruction;
+    const switch_value = try saValue(allocator, header[0]);
+    defer allocator.free(switch_value);
+    const default_text = trim(header[1]);
+    if (!std.mem.startsWith(u8, default_text, "label ")) return error.UnsupportedInstruction;
+    const default_label = try labelName(allocator, llvmTypedValueToValue(default_text["label ".len..]));
+    defer allocator.free(default_label);
+
+    var cases = std.array_list.Managed([]const []const u8).init(allocator);
+    defer {
+        for (cases.items) |parts| allocator.free(parts);
+        cases.deinit();
+    }
+    var case_lines = std.mem.splitScalar(u8, text[open + 1 .. close], '\n');
+    while (case_lines.next()) |raw_case| {
+        const case_line = trim(raw_case);
+        if (case_line.len == 0) continue;
+        {
+            const parts = try splitTopLevelComma(allocator, case_line);
+            defer allocator.free(parts);
+            if (parts.len == 0 or parts.len % 2 != 0) return error.UnsupportedInstruction;
+            var part_idx: usize = 0;
+            while (part_idx < parts.len) : (part_idx += 2) {
+                const pair = try allocator.alloc([]const u8, 2);
+                pair[0] = parts[part_idx];
+                pair[1] = parts[part_idx + 1];
+                cases.append(pair) catch |err| {
+                    allocator.free(pair);
+                    return err;
+                };
+            }
+        }
+    }
+
+    if (cases.items.len == 0) {
+        try listPrint(out, "  jmp {s}\n", .{default_label});
+        return;
+    }
+
+    for (cases.items, 0..) |parts, idx| {
+        const case_ty = firstTypeToken(parts[0]) orelse return error.UnsupportedInstruction;
+        if (!std.mem.eql(u8, sa_ty, typeTokenToSa(case_ty) orelse return error.UnsupportedInstruction)) {
+            return error.UnsupportedInstruction;
+        }
+        const case_value = try saValue(allocator, parts[0]);
+        defer allocator.free(case_value);
+        const case_label_text = trim(parts[1]);
+        if (!std.mem.startsWith(u8, case_label_text, "label ")) return error.UnsupportedInstruction;
+        const case_label = try labelName(allocator, llvmTypedValueToValue(case_label_text["label ".len..]));
+        defer allocator.free(case_label);
+
+        const cmp_name = try std.fmt.allocPrint(allocator, "bc2sa_switch_cmp_{d}_{d}", .{ switch_id, idx });
+        defer allocator.free(cmp_name);
+        try listPrint(out, "  {s} = eq {s}, {s}\n", .{ cmp_name, switch_value, case_value });
+
+        if (idx + 1 == cases.items.len) {
+            try listPrint(out, "  br {s} -> {s}, {s}\n", .{ cmp_name, case_label, default_label });
+        } else {
+            const next_label = try std.fmt.allocPrint(allocator, "L_BC2SA_SWITCH_NEXT_{d}_{d}", .{ switch_id, idx });
+            defer allocator.free(next_label);
+            try listPrint(out, "  br {s} -> {s}, {s}\n", .{ cmp_name, case_label, next_label });
+            try listPrint(out, "{s}:\n", .{next_label});
+        }
+    }
+}
+
+fn isPhiInstruction(line: []const u8) bool {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return false;
+    var words = std.mem.tokenizeAny(u8, trim(line[eq + 1 ..]), " \t\r\n");
+    return if (words.next()) |op| std.mem.eql(u8, op, "phi") else false;
+}
+
+fn parsePhi(allocator: std.mem.Allocator, line: []const u8) !struct { lhs: []const u8, ty: []const u8, incoming: []const []const u8 } {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidIr;
+    const lhs = trim(line[0..eq]);
+    const rhs = trim(line[eq + 1 ..]);
+    if (!std.mem.startsWith(u8, rhs, "phi ")) return error.UnsupportedPhi;
+    const body = trim(rhs["phi ".len..]);
+    const ty = firstTypeToken(body) orelse return error.UnsupportedPhi;
+    const ty_idx = std.mem.indexOf(u8, body, ty) orelse return error.InvalidIr;
+    const incoming = try splitTopLevelComma(allocator, trim(body[ty_idx + ty.len ..]));
+    if (incoming.len == 0) {
+        allocator.free(incoming);
+        return error.UnsupportedPhi;
+    }
+    return .{ .lhs = lhs, .ty = ty, .incoming = incoming };
+}
+
+fn phiSlotName(allocator: std.mem.Allocator, lhs: []const u8) ![]u8 {
+    const dst = try sanitizeIdent(allocator, lhs, "r");
+    defer allocator.free(dst);
+    return try std.fmt.allocPrint(allocator, "bc2sa_phi_slot_{s}", .{dst});
+}
+
+fn appendPhiSlots(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, phi_lines: []const []const u8) !void {
+    for (phi_lines) |phi_line| {
+        const phi = try parsePhi(allocator, phi_line);
+        defer allocator.free(phi.incoming);
+        const size = typeBytes(phi.ty) orelse return error.UnsupportedPhi;
+        const slot = try phiSlotName(allocator, phi.lhs);
+        defer allocator.free(slot);
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
+    }
+}
+
+fn appendPhiLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, line: []const u8) !void {
+    const phi = try parsePhi(allocator, line);
+    defer allocator.free(phi.incoming);
+    const sa_ty = typeTokenToSa(phi.ty) orelse return error.UnsupportedPhi;
+    const dst = try sanitizeIdent(allocator, phi.lhs, "r");
+    defer allocator.free(dst);
+    const slot = try phiSlotName(allocator, phi.lhs);
+    defer allocator.free(slot);
+    try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ dst, slot, sa_ty });
+}
+
+fn appendPhiStoresForBlock(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, phi_lines: []const []const u8, block: []const u8) !void {
+    for (phi_lines) |phi_line| {
+        const phi = try parsePhi(allocator, phi_line);
+        defer allocator.free(phi.incoming);
+        const sa_ty = typeTokenToSa(phi.ty) orelse return error.UnsupportedPhi;
+        const slot = try phiSlotName(allocator, phi.lhs);
+        defer allocator.free(slot);
+        for (phi.incoming) |incoming_text| {
+            const pair_text = trim(incoming_text);
+            if (pair_text.len < 2 or pair_text[0] != '[' or pair_text[pair_text.len - 1] != ']') return error.UnsupportedPhi;
+            const pair = try splitTopLevelComma(allocator, pair_text[1 .. pair_text.len - 1]);
+            defer allocator.free(pair);
+            if (pair.len != 2) return error.UnsupportedPhi;
+            const incoming_block = stripLlvmSigil(llvmTypedValueToValue(pair[1]));
+            if (!std.mem.eql(u8, trim(incoming_block), trim(block))) continue;
+            const value = try saValue(allocator, pair[0]);
+            defer allocator.free(value);
+            try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ slot, value, sa_ty });
+        }
+    }
+}
+
+fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, header: []const u8, body: []const []const u8) !void {
+    try appendFunctionHeader(out, allocator, header, false);
+
+    var phi_lines = std.array_list.Managed([]const u8).init(allocator);
+    defer phi_lines.deinit();
+    for (body) |line| if (isPhiInstruction(line)) try phi_lines.append(line);
+
+    var switch_text = std.array_list.Managed(u8).init(allocator);
+    defer switch_text.deinit();
+    var pending_switch = false;
+    var switch_id: usize = 0;
+    var need_entry_label = true;
+    var phi_slots_emitted = false;
+    var current_block: []const u8 = "entry";
+
+    for (body) |raw_body_line| {
+        const line = trim(cleanInstructionLine(raw_body_line));
+        if (line.len == 0) continue;
+        if (pending_switch) {
+            try switch_text.appendSlice(line);
+            try switch_text.append('\n');
+            if (std.mem.indexOfScalar(u8, line, ']') != null) {
+                try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+                try appendSwitch(out, allocator, switch_text.items, switch_id);
+                switch_id += 1;
+                switch_text.clearRetainingCapacity();
+                pending_switch = false;
+            }
+            continue;
+        }
+        if (std.mem.endsWith(u8, line, ":")) {
+            try appendLabel(out, allocator, line[0 .. line.len - 1]);
+            current_block = line[0 .. line.len - 1];
+            need_entry_label = false;
+            if (!phi_slots_emitted) {
+                try appendPhiSlots(out, allocator, phi_lines.items);
+                phi_slots_emitted = true;
+            }
+            continue;
+        }
+        if (need_entry_label) {
+            try out.appendSlice("L_ENTRY:\n");
+            try appendPhiSlots(out, allocator, phi_lines.items);
+            phi_slots_emitted = true;
+            need_entry_label = false;
+        }
+        if (startsWithWord(line, "switch")) {
+            switch_text.clearRetainingCapacity();
+            try switch_text.appendSlice(line);
+            try switch_text.append('\n');
+            if (std.mem.indexOfScalar(u8, line, ']') != null) {
+                try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+                try appendSwitch(out, allocator, switch_text.items, switch_id);
+                switch_id += 1;
+                switch_text.clearRetainingCapacity();
+            } else {
+                pending_switch = true;
+            }
+            continue;
+        }
+        if (startsWithWord(line, "br") or startsWithWord(line, "ret")) {
+            try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+        }
+        if (isPhiInstruction(line)) {
+            try appendPhiLoad(out, allocator, line);
+        } else {
+            try appendInstruction(out, allocator, line);
+        }
+    }
+    if (pending_switch) return error.InvalidIr;
+    try out.append('\n');
+}
+
 fn appendGetElementPtr(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8) !void {
     var body = trim(rest);
     if (std.mem.startsWith(u8, body, "inbounds ")) body = trim(body["inbounds ".len..]);
@@ -689,11 +1040,15 @@ fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.
     const rest_start = std.mem.indexOf(u8, rhs, op) orelse return error.InvalidIr;
     const rest = trim(rhs[rest_start + op.len ..]);
 
+    if (std.mem.eql(u8, op, "phi")) return error.UnsupportedPhi;
     if (llvmBinaryOpToSa(op) != null) return appendBinaryOp(out, allocator, lhs, op, rest);
+    if (llvmFloatOpToSa(op) != null) return appendFloatOp(out, allocator, lhs, op, rest);
     if (std.mem.eql(u8, op, "icmp")) return appendIcmp(out, allocator, lhs, rest);
+    if (std.mem.eql(u8, op, "fcmp")) return appendFcmp(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "alloca")) return appendAlloca(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "load")) return appendLoad(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "getelementptr")) return appendGetElementPtr(out, allocator, lhs, rest);
+    if (std.mem.eql(u8, op, "select")) return appendSelect(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "call") or std.mem.indexOf(u8, rhs, " call ") != null) return appendCall(out, allocator, lhs, rhs);
     if (std.mem.eql(u8, op, "trunc") or std.mem.eql(u8, op, "zext") or std.mem.eql(u8, op, "sext") or std.mem.eql(u8, op, "bitcast")) {
         return appendCast(out, allocator, lhs, op, rest);
@@ -806,56 +1161,42 @@ pub fn translateIrSource(allocator: std.mem.Allocator, source: []const u8) ![]u8
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
 
-    var in_function = false;
-    var need_entry_label = false;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw_line| {
         const trimmed_line = trim(raw_line);
         if (trimmed_line.len == 0) continue;
         if (std.mem.startsWith(u8, trimmed_line, ";")) continue;
 
-        if (!in_function) {
-            if (try appendConstDecl(&out, allocator, trimmed_line)) continue;
-            const cleaned = cleanInstructionLine(trimmed_line);
-            const line = trim(cleaned);
-            if (line.len == 0) continue;
-            if (startsWithWord(line, "declare")) {
-                try appendFunctionHeader(&out, allocator, line, true);
-                continue;
-            }
-            if (startsWithWord(line, "define")) {
-                try appendFunctionHeader(&out, allocator, line, false);
-                in_function = true;
-                need_entry_label = true;
-                continue;
-            }
-            continue;
-        }
-
+        if (try appendConstDecl(&out, allocator, trimmed_line)) continue;
         const cleaned = cleanInstructionLine(trimmed_line);
         const line = trim(cleaned);
         if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, "}")) {
-            in_function = false;
-            need_entry_label = false;
-            try out.append('\n');
+        if (startsWithWord(line, "declare")) {
+            try appendFunctionHeader(&out, allocator, line, true);
             continue;
         }
-
-        if (std.mem.endsWith(u8, line, ":")) {
-            try appendLabel(&out, allocator, line[0 .. line.len - 1]);
-            need_entry_label = false;
+        if (startsWithWord(line, "define")) {
+            var body = std.array_list.Managed([]const u8).init(allocator);
+            defer body.deinit();
+            var closed = false;
+            while (lines.next()) |raw_body_line| {
+                const body_line = trim(cleanInstructionLine(trim(raw_body_line)));
+                if (body_line.len == 0) continue;
+                if (std.mem.eql(u8, body_line, "}")) {
+                    closed = true;
+                    break;
+                }
+                try body.append(body_line);
+            }
+            if (!closed) return error.InvalidIr;
+            try appendFunctionBody(&out, allocator, line, body.items);
             continue;
         }
-
-        if (need_entry_label) {
-            try out.appendSlice("L_ENTRY:\n");
-            need_entry_label = false;
-        }
+        // A stray closing brace outside any function is malformed IR.
+        if (std.mem.eql(u8, line, "}")) return error.InvalidIr;
         try appendInstruction(&out, allocator, line);
     }
 
-    if (in_function) return error.InvalidIr;
     return try out.toOwnedSlice();
 }
 
@@ -881,8 +1222,35 @@ fn runLlvmDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u
     }
 }
 
+fn runClangDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u8) !?[]u8 {
+    const argv = [_][]const u8{ exe, "-S", "-emit-llvm", path, "-o", "-" };
+    const result = std.process.run(allocator, io(), .{
+        .argv = argv[0..],
+        .stdout_limit = .limited(max_ir_bytes),
+        .stderr_limit = .limited(max_ir_bytes),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    errdefer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return result.stdout;
+            return error.LlvmDisFailed;
+        },
+        else => return error.LlvmDisFailed,
+    }
+}
+
 fn disassembleBitcode(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (try runLlvmDisTool(allocator, llvm_dis_path, path)) |ir| return ir;
+    for (llvm_dis_candidates) |candidate| {
+        if (try runLlvmDisTool(allocator, candidate, path)) |ir| return ir;
+    }
+    for (clang_candidates) |candidate| {
+        if (try runClangDisTool(allocator, candidate, path)) |ir| return ir;
+    }
     return error.LlvmDisNotFound;
 }
 
@@ -903,19 +1271,22 @@ pub fn translateBitcodeFile(allocator: std.mem.Allocator, path: []const u8) ![]u
 }
 
 fn llvmAs(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
-    const argv = [_][]const u8{ "llvm-as-14", input_path, "-o", output_path };
-    const result = std.process.run(allocator, io(), .{
-        .argv = argv[0..],
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.SkipZigTest,
-        else => return error.SkipZigTest,
+    for (llvm_as_candidates) |candidate| {
+        const argv = [_][]const u8{ candidate, input_path, "-o", output_path };
+        const result = std.process.run(allocator, io(), .{
+            .argv = argv[0..],
+        }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code == 0) return,
+            else => {},
+        }
     }
+    return error.SkipZigTest;
 }
 
 test "bc2sa translates real llvm bitcode" {
@@ -992,4 +1363,100 @@ test "bc2sa accepts constant gep inside static array bound" {
     const out = try translateIrSource(std.testing.allocator, ir);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "slot = ptr_add arr, 3"));
+}
+
+test "bc2sa lowers float arithmetic" {
+    const ir =
+        \\define double @fadd2(double %a, double %b) {
+        \\entry:
+        \\  %s = fadd double %a, %b
+        \\  ret double %s
+        \\}
+        \\
+    ;
+
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "s = fadd a, b"));
+}
+
+test "bc2sa lowers float comparison" {
+    const ir =
+        \\define i1 @flt(double %a, double %b) {
+        \\entry:
+        \\  %c = fcmp olt double %a, %b
+        \\  ret i1 %c
+        \\}
+        \\
+    ;
+
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "c = fcmp_lt a, b"));
+}
+
+test "bc2sa lowers scalar select through a stack slot" {
+    const ir =
+        \\define i32 @pick(i1 %c, i32 %a, i32 %b) {
+        \\entry:
+        \\  %s = select i1 %c, i32 %a, i32 %b
+        \\  ret i32 %s
+        \\}
+        \\
+    ;
+
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_select_slot_s = stack_alloc 4"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br c -> L_BC2SA_SELECT_TRUE_s, L_BC2SA_SELECT_FALSE_s"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "s = load bc2sa_select_slot_s+0 as i32"));
+}
+
+test "bc2sa lowers switch into eq and branch chain" {
+    const ir =
+        \\define i32 @dispatch(i32 %v) {
+        \\entry:
+        \\  switch i32 %v, label %d [
+        \\    i32 1, label %one
+        \\    i32 2, label %two
+        \\  ]
+        \\one:
+        \\  ret i32 1
+        \\two:
+        \\  ret i32 2
+        \\d:
+        \\  ret i32 0
+        \\}
+        \\
+    ;
+
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_switch_cmp_0_0 = eq v, 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br bc2sa_switch_cmp_0_0 -> L_one, L_BC2SA_SWITCH_NEXT_0_0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br bc2sa_switch_cmp_0_1 -> L_two, L_d"));
+}
+
+test "bc2sa lowers scalar phi through a stack slot" {
+    const ir =
+        \\define i32 @sum(i32 %n) {
+        \\entry:
+        \\  br label %loop
+        \\loop:
+        \\  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+        \\  %next = add i32 %i, 1
+        \\  %done = icmp sge i32 %next, %n
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  ret i32 %next
+        \\}
+        \\
+    ;
+
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_phi_slot_i = stack_alloc 4"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_phi_slot_i+0, 0 as i32"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_phi_slot_i+0, next as i32"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "i = load bc2sa_phi_slot_i+0 as i32"));
 }
