@@ -15,11 +15,12 @@ pub const TranslateError = error{
 const bitcode_magic = [_]u8{ 'B', 'C', 0xc0, 0xde };
 const max_bitcode_bytes = 64 * 1024 * 1024;
 const max_ir_bytes = 64 * 1024 * 1024;
-// NOTE: multi-version candidates, newest first. `sap.json` process whitelist
-// must stay in sync when this list changes.
-const llvm_dis_candidates = [_][]const u8{ "/usr/bin/llvm-dis-17", "/usr/bin/llvm-dis-16", "/usr/bin/llvm-dis-15", "/usr/bin/llvm-dis-14", "llvm-dis-17", "llvm-dis-16", "llvm-dis-15", "llvm-dis-14", "llvm-dis" };
-const clang_candidates = [_][]const u8{ "/usr/bin/clang", "clang" };
-const llvm_as_candidates = [_][]const u8{ "llvm-as-17", "llvm-as-16", "llvm-as-15", "llvm-as-14", "llvm-as" };
+// NOTE: multi-version candidates, newest first. Must stay a subset of the
+// absolute paths whitelisted in `sap.json` process.exec: the plugin sandbox
+// denies spawning anything not on that list.
+const llvm_dis_candidates = [_][]const u8{ "/usr/bin/llvm-dis-17", "/usr/bin/llvm-dis-16", "/usr/bin/llvm-dis-15", "/usr/bin/llvm-dis-14" };
+const clang_candidates = [_][]const u8{"/usr/bin/clang"};
+const llvm_as_candidates = [_][]const u8{ "/usr/bin/llvm-as-17", "/usr/bin/llvm-as-16", "/usr/bin/llvm-as-15", "/usr/bin/llvm-as-14" };
 
 /// NOTE(Zig 0.17): ambient filesystem/subprocess access was removed; every
 /// fs/process op needs an explicit `Io`. Lazily created once per process.
@@ -355,6 +356,13 @@ fn saValue(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (std.mem.eql(u8, value, "true")) return try allocator.dupe(u8, "1");
     if (std.mem.eql(u8, value, "false")) return try allocator.dupe(u8, "0");
     if (std.fmt.parseInt(i64, value, 10)) |_| return try allocator.dupe(u8, value) else |_| {}
+    if (std.fmt.parseFloat(f64, value)) |number| return try std.fmt.allocPrint(allocator, "{d}", .{number}) else |_| {}
+    if (std.mem.startsWith(u8, value, "0x")) {
+        if (std.fmt.parseInt(u64, value[2..], 16)) |bits| {
+            const number: f64 = @bitCast(bits);
+            return try std.fmt.allocPrint(allocator, "{d}", .{number});
+        } else |_| {}
+    }
 
     if (std.mem.startsWith(u8, value, "getelementptr")) {
         return try saGetElementPtrConstant(allocator, value);
@@ -1193,8 +1201,11 @@ pub fn translateIrSource(allocator: std.mem.Allocator, source: []const u8) ![]u8
             continue;
         }
         // A stray closing brace outside any function is malformed IR.
+        // Any other top-level line (source_filename, target triple /
+        // datalayout, module asm, attribute groups) carries no executable
+        // semantics and is ignored.
         if (std.mem.eql(u8, line, "}")) return error.InvalidIr;
-        try appendInstruction(&out, allocator, line);
+        continue;
     }
 
     return try out.toOwnedSlice();
@@ -1321,6 +1332,33 @@ test "bc2sa translates real llvm bitcode" {
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "r1 = sgt r0, 2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br r1 -> L_ok, L_err"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "return r0"));
+}
+
+test "bc2sa translates real llvm bitcode with float and select" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io(), .{ .sub_path = "float.ll", .data = 
+        \\define double @blend(i1 %c, double %a, double %b) {
+        \\entry:
+        \\  %s = select i1 %c, double %a, double %b
+        \\  %r = fadd double %s, 1.5
+        \\  ret double %r
+        \\}
+        \\
+    });
+    const ll_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "float.ll" });
+    defer std.testing.allocator.free(ll_path);
+    const tmp_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(tmp_path);
+    const bc_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "float.bc" });
+    defer std.testing.allocator.free(bc_path);
+    try llvmAs(std.testing.allocator, ll_path, bc_path);
+
+    const out = try translateBitcodeFile(std.testing.allocator, bc_path);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_select_slot_s = stack_alloc 8"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "s = load bc2sa_select_slot_s+0 as f64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "r = fadd s, 1.5"));
 }
 
 test "bc2sa rejects text llvm ir on bitcode-only path" {

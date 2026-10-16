@@ -46,31 +46,7 @@
           "args": ["-o", "-", "*"]
         },
         {
-          "path": "llvm-dis-17",
-          "args": ["-o", "-", "*"]
-        },
-        {
-          "path": "llvm-dis-16",
-          "args": ["-o", "-", "*"]
-        },
-        {
-          "path": "llvm-dis-15",
-          "args": ["-o", "-", "*"]
-        },
-        {
-          "path": "llvm-dis-14",
-          "args": ["-o", "-", "*"]
-        },
-        {
-          "path": "llvm-dis",
-          "args": ["-o", "-", "*"]
-        },
-        {
           "path": "/usr/bin/clang",
-          "args": ["-S", "-emit-llvm", "*", "-o", "-"]
-        },
-        {
-          "path": "clang",
           "args": ["-S", "-emit-llvm", "*", "-o", "-"]
         }
       ]
