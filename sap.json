@@ -21,14 +21,33 @@
     "fs": [
       { "op": "read", "path": "$PROJECT/**" }
     ],
-    "net": [],
+    "net": [
+      { "url": "http://localhost", "methods": ["GET"] },
+      { "url": "http://127.0.0.1", "methods": ["GET"] }
+    ],
     "env": ["HOME", "SA_*"],
     "process": {
       "spawn": true,
       "exec": [
         {
+          "path": "/usr/bin/llvm-dis-17",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-16",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-15",
+          "args": ["-o", "-", "*"]
+        },
+        {
           "path": "/usr/bin/llvm-dis-14",
           "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/clang",
+          "args": ["-S", "-emit-llvm", "*", "-o", "-"]
         }
       ]
     }

@@ -14,20 +14,48 @@ const skills = [_]plugin_api.SkillSection{
     },
 };
 
-const StreamCtx = struct {
+/// NOTE(Zig 0.17): `std.io.AnyWriter` was removed. Host output goes through
+/// `*std.Io.Writer` with an unbuffered drain into the host stream.
+const HostWriter = struct {
+    writer: std.Io.Writer,
     stream: plugin_api.HostStream,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *HostWriter = @fieldParentPtr("writer", w);
+        const write_all = self.stream.write_all orelse return error.WriteFailed;
+        const ok = @intFromEnum(plugin_api.AbiStatus.ok);
+        if (w.end > 0) {
+            if (write_all(self.stream.ctx, w.buffer.ptr, w.end) != ok) return error.WriteFailed;
+            w.end = 0;
+        }
+        for (data[0 .. data.len - 1]) |slice| {
+            if (write_all(self.stream.ctx, slice.ptr, slice.len) != ok) return error.WriteFailed;
+        }
+        const last = data[data.len - 1];
+        var r: usize = 0;
+        while (r < splat) : (r += 1) {
+            if (write_all(self.stream.ctx, last.ptr, last.len) != ok) return error.WriteFailed;
+        }
+        return std.Io.Writer.countSplat(data, splat);
+    }
+
+    fn init(stream: plugin_api.HostStream) HostWriter {
+        return .{
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+            .stream = stream,
+        };
+    }
 };
+
+fn makeHostWriter(stream: plugin_api.HostStream, storage: *HostWriter) ?*std.Io.Writer {
+    if (stream.write_all == null or stream.ctx == null) return null;
+    storage.* = HostWriter.init(stream);
+    return &storage.writer;
+}
 
 const CaptureCtx = struct {
-    buffer: *std.ArrayList(u8),
+    buffer: *std.array_list.Managed(u8),
 };
-
-fn writeAll(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
-    const self = @as(*const StreamCtx, @ptrCast(@alignCast(ctx)));
-    const write_all = self.stream.write_all orelse return error.WriteFailed;
-    if (write_all(self.stream.ctx, bytes.ptr, bytes.len) != @intFromEnum(plugin_api.AbiStatus.ok)) return error.WriteFailed;
-    return bytes.len;
-}
 
 fn captureWriteAll(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) u32 {
     const self = @as(*CaptureCtx, @ptrCast(@alignCast(ctx.?)));
@@ -48,7 +76,7 @@ fn cArgvToSlice(argv: []const [*:0]const u8, allocator: std.mem.Allocator) ![]co
     return out;
 }
 
-fn runLlvm2SaCommand(ctx: *const plugin_api.Context, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+fn runLlvm2SaCommand(ctx: *const plugin_api.Context, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 2) return null;
     if (!std.mem.eql(u8, argv[1], "bc2sa")) return null;
     if (argv.len < 3) return error.MissingSourcePath;
@@ -62,7 +90,7 @@ fn runLlvm2SaCommand(ctx: *const plugin_api.Context, argv: []const []const u8, s
     return 0;
 }
 
-fn writeTranslateError(writer: std.io.AnyWriter, err: anyerror) !void {
+fn writeTranslateError(writer: *std.Io.Writer, err: anyerror) !void {
     const detail = switch (err) {
         error.StaticMemoryOverflow => .{
             .code = "SA-CLI-019",
@@ -103,7 +131,7 @@ fn bc2saCliHint(err: anyerror) []const u8 {
     };
 }
 
-fn writeBc2SaCliError(writer: std.io.AnyWriter, err: anyerror) !void {
+fn writeBc2SaCliError(writer: *std.Io.Writer, err: anyerror) !void {
     const message = switch (err) {
         error.MissingSourcePath => "missing required bitcode input",
         error.UnexpectedArgument => "unexpected bc2sa argument",
@@ -122,10 +150,10 @@ fn runLlvm2SaCommandAbi(ctx: *const plugin_api.Context, argv: [*]const [*:0]cons
     if (argv_len < 2) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
     if (!std.mem.eql(u8, std.mem.span(argv[1]), "bc2sa")) return @intFromEnum(plugin_api.AbiStatus.unknown_command);
 
-    var stdout_ctx = StreamCtx{ .stream = stdout };
-    var stderr_ctx = StreamCtx{ .stream = stderr };
-    const stdout_writer = std.io.AnyWriter{ .context = &stdout_ctx, .writeFn = writeAll };
-    const stderr_writer = std.io.AnyWriter{ .context = &stderr_ctx, .writeFn = writeAll };
+    var stdout_storage: HostWriter = undefined;
+    var stderr_storage: HostWriter = undefined;
+    const stdout_writer = makeHostWriter(stdout, &stdout_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const stderr_writer = makeHostWriter(stderr, &stderr_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
     const args = cArgvToSlice(argv[0..argv_len], ctx.allocator) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     defer ctx.allocator.free(args);
 
@@ -170,9 +198,9 @@ test "bc2sa plugin exports runtime descriptor and skills" {
 }
 
 test "bc2sa plugin abi maps missing input to cli diagnostic" {
-    var stdout_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
     var stdout_ctx = CaptureCtx{ .buffer = &stdout_buf };
     var stderr_ctx = CaptureCtx{ .buffer = &stderr_buf };
@@ -197,11 +225,11 @@ test "bc2sa plugin abi maps missing input to cli diagnostic" {
 }
 
 test "bc2sa plugin formats static memory overflow diagnostic" {
-    var stderr_buf = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buf.deinit();
     var capture_ctx = CaptureCtx{ .buffer = &stderr_buf };
-    var stderr_ctx = StreamCtx{ .stream = makeCaptureStream(&capture_ctx) };
-    const stderr_writer = std.io.AnyWriter{ .context = &stderr_ctx, .writeFn = writeAll };
+    var stderr_storage: HostWriter = undefined;
+    const stderr_writer = makeHostWriter(makeCaptureStream(&capture_ctx), &stderr_storage).?;
 
     try writeTranslateError(stderr_writer, error.StaticMemoryOverflow);
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buf.items, 1, "error[SA-CLI-019]: static memory overflow detected in LLVM bitcode"));
