@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const sa_bin = b.option([]const u8, "sa-bin", "Path to the SA host binary used for bc2sa install smoke tests.") orelse "sa";
+    const sa_bin = b.option([]const u8, "sa-bin", "Path to the SA host binary used for bc2sa install smoke tests.") orelse "../sci/zig-out/bin/sa";
     const plugin_api = b.createModule(.{
         .root_source_file = b.path("src/plugin_api.zig"),
         .target = target,
