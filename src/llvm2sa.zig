@@ -848,20 +848,44 @@ fn isPhiInstruction(line: []const u8) bool {
     return if (words.next()) |op| std.mem.eql(u8, op, "phi") else false;
 }
 
+/// Parse one LLVM type at the start of `text` (after trimming): a scalar
+/// token, a `{ ... }` struct type, or a `[ N x T ]` array type. Returns the
+/// type text and the remainder of the string.
+fn parseTypeText(text: []const u8) ?struct { ty: []const u8, rest: []const u8 } {
+    const t = trim(text);
+    if (t.len == 0) return null;
+    if (t[0] == '{') {
+        const close = findMatching(t, 0, '{', '}') orelse return null;
+        return .{ .ty = t[0 .. close + 1], .rest = trim(t[close + 1 ..]) };
+    }
+    if (t[0] == '[') {
+        const close = findMatching(t, 0, '[', ']') orelse return null;
+        return .{ .ty = t[0 .. close + 1], .rest = trim(t[close + 1 ..]) };
+    }
+    var end: usize = 0;
+    while (end < t.len and !std.ascii.isWhitespace(t[end]) and t[end] != ',') : (end += 1) {}
+    if (end == 0) return null;
+    return .{ .ty = t[0..end], .rest = trim(t[end..]) };
+}
+
+fn isAggType(ty_text: []const u8) bool {
+    const t = trim(ty_text);
+    return t.len > 0 and (t[0] == '{' or t[0] == '[');
+}
+
 fn parsePhi(allocator: std.mem.Allocator, line: []const u8) !struct { lhs: []const u8, ty: []const u8, incoming: []const []const u8 } {
     const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidIr;
     const lhs = trim(line[0..eq]);
     const rhs = trim(line[eq + 1 ..]);
     if (!std.mem.startsWith(u8, rhs, "phi ")) return error.UnsupportedPhi;
     const body = trim(rhs["phi ".len..]);
-    const ty = firstTypeToken(body) orelse return error.UnsupportedPhi;
-    const ty_idx = std.mem.indexOf(u8, body, ty) orelse return error.InvalidIr;
-    const incoming = try splitTopLevelComma(allocator, trim(body[ty_idx + ty.len ..]));
+    const parsed = parseTypeText(body) orelse return error.UnsupportedPhi;
+    const incoming = try splitTopLevelComma(allocator, parsed.rest);
     if (incoming.len == 0) {
         allocator.free(incoming);
         return error.UnsupportedPhi;
     }
-    return .{ .lhs = lhs, .ty = ty, .incoming = incoming };
+    return .{ .lhs = lhs, .ty = parsed.ty, .incoming = incoming };
 }
 
 fn phiSlotName(allocator: std.mem.Allocator, lhs: []const u8) ![]u8 {
@@ -914,12 +938,288 @@ fn appendPhiStoresForBlock(out: *std.array_list.Managed(u8), allocator: std.mem.
     }
 }
 
+/// Cross-block value analysis (probe REPORT.md, ruling 1).
+///
+/// The SA referee requires every computed register to be declared in the
+/// block that uses it; only function parameters and `stack_alloc` slot
+/// pointers are function-level. LLVM SSA values, however, are routinely
+/// used in blocks other than their defining block — most importantly phi
+/// incoming values stored on predecessor edges (M1: the value was defined
+/// in an earlier, non-predecessor block) and phi results consumed by later
+/// blocks (M2: a loop header phi loaded once and reused in the latch).
+///
+/// Strategy (chosen over full SSA slotting, which would rewrite every
+/// definition and destabilize all existing lowerings): a value whose uses
+/// span blocks gets a dedicated stack slot. Its definition, in its home
+/// block, is followed by a store into the slot; every use in a foreign
+/// block is preceded (once per block) by a reload that re-declares the
+/// same register name from the slot in that block. In-block uses keep the
+/// original register form untouched. Phi values reuse their existing phi
+/// slot as the backing store.
+const ValueDef = struct {
+    ty: []const u8,
+    home: []const u8,
+    is_phi: bool,
+};
+
+const FnCtx = struct {
+    allocator: std.mem.Allocator,
+    defs: std.StringHashMapUnmanaged(ValueDef) = .empty,
+    cross: std.StringHashMapUnmanaged(bool) = .empty,
+    reloaded: std.StringHashMapUnmanaged(bool) = .empty,
+    current_block: []const u8 = "entry",
+    agg_ret_ty: ?[]const u8 = null,
+
+    fn deinit(self: *FnCtx) void {
+        self.defs.deinit(self.allocator);
+        self.cross.deinit(self.allocator);
+        self.reloaded.deinit(self.allocator);
+    }
+
+    fn slotName(self: *FnCtx, name: []const u8, def: ValueDef) ![]u8 {
+        if (def.is_phi) return phiSlotName(self.allocator, name);
+        const san = try sanitizeIdent(self.allocator, name, "r");
+        defer self.allocator.free(san);
+        return try std.fmt.allocPrint(self.allocator, "bc2sa_xslot_{s}", .{san});
+    }
+
+    fn isCross(self: *FnCtx, name: []const u8) bool {
+        return self.cross.get(name) orelse false;
+    }
+
+    /// Emit a same-name reload for `name` in the current block if it is a
+    /// cross-block value defined elsewhere and not yet reloaded here.
+    fn emitReload(self: *FnCtx, out: *std.array_list.Managed(u8), name: []const u8) !void {
+        if (!self.isCross(name)) return;
+        const def = self.defs.get(name) orelse return;
+        if (std.mem.eql(u8, def.home, self.current_block)) return;
+        if (self.reloaded.get(name) orelse false) return;
+        const sa_ty = typeTokenToSa(def.ty) orelse return;
+        const slot = try self.slotName(name, def);
+        defer self.allocator.free(slot);
+        const san = try sanitizeIdent(self.allocator, name, "r");
+        defer self.allocator.free(san);
+        try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ san, slot, sa_ty });
+        try self.reloaded.put(self.allocator, name, true);
+    }
+
+    fn emitReloadsForLine(self: *FnCtx, out: *std.array_list.Managed(u8), line: []const u8, skip_lhs: bool) !void {
+        var names = std.array_list.Managed([]const u8).init(self.allocator);
+        defer names.deinit();
+        try scanValueNames(line, &names);
+        const lhs = if (skip_lhs) defLhsName(line) else null;
+        for (names.items) |name| {
+            if (lhs) |l| {
+                if (std.mem.eql(u8, l, name)) continue;
+            }
+            try self.emitReload(out, name);
+        }
+    }
+
+    /// Phi incoming values for the current block are *uses in this block*
+    /// (the edge store is emitted here), even when the value's home is a
+    /// third block (M1). Reload them before the edge stores.
+    fn emitReloadsForPhiIncoming(self: *FnCtx, out: *std.array_list.Managed(u8), phi_lines: []const []const u8) !void {
+        for (phi_lines) |phi_line| {
+            const phi = try parsePhi(self.allocator, phi_line);
+            defer self.allocator.free(phi.incoming);
+            for (phi.incoming) |incoming_text| {
+                const pair_text = trim(incoming_text);
+                if (pair_text.len < 2 or pair_text[0] != '[' or pair_text[pair_text.len - 1] != ']') continue;
+                const pair = try splitTopLevelComma(self.allocator, pair_text[1 .. pair_text.len - 1]);
+                defer self.allocator.free(pair);
+                if (pair.len != 2) continue;
+                const incoming_block = stripLlvmSigil(llvmTypedValueToValue(pair[1]));
+                if (!std.mem.eql(u8, trim(incoming_block), trim(self.current_block))) continue;
+                var names = std.array_list.Managed([]const u8).init(self.allocator);
+                defer names.deinit();
+                try scanValueNames(pair[0], &names);
+                for (names.items) |name| try self.emitReload(out, name);
+            }
+        }
+    }
+};
+
+fn defLhsName(line: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    const lhs = trim(line[0..eq]);
+    if (lhs.len < 2 or lhs[0] != '%') return null;
+    if (std.mem.indexOfAny(u8, lhs, " \t") != null) return null;
+    return stripLlvmSigil(lhs);
+}
+
+/// Collect `%name` value references in a line fragment. Names may contain
+/// letters, digits, '.', '$', '-', '_' (LLVM unquoted identifiers).
+fn scanValueNames(text: []const u8, names: *std.array_list.Managed([]const u8)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] != '%') {
+            i += 1;
+            continue;
+        }
+        var j = i + 1;
+        while (j < text.len and (isIdentChar(text[j]) or text[j] == '.' or text[j] == '$' or text[j] == '-')) : (j += 1) {}
+        if (j > i + 1) try names.append(text[i + 1 .. j]);
+        i = @max(j, i + 1);
+    }
+}
+
+/// Best-effort LLVM result type text for a definition line; null when the
+/// shape is not one we can slot (aggregates are handled by the aggregate
+/// slot machinery, not the cross-block slots).
+fn resultTypeOfDef(allocator: std.mem.Allocator, line: []const u8) !?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    const rhs = trim(line[eq + 1 ..]);
+    var words = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
+    const op = words.next() orelse return null;
+    const rest_start = std.mem.indexOf(u8, rhs, op) orelse return null;
+    const rest = trim(rhs[rest_start + op.len ..]);
+
+    if (std.mem.eql(u8, op, "phi")) {
+        const phi = try parsePhi(allocator, line);
+        defer allocator.free(phi.incoming);
+        return phi.ty;
+    }
+    if (std.mem.eql(u8, op, "icmp") or std.mem.eql(u8, op, "fcmp")) return "i1";
+    if (std.mem.eql(u8, op, "alloca") or std.mem.eql(u8, op, "getelementptr")) return "ptr";
+    if (std.mem.eql(u8, op, "select")) {
+        const args = try splitTopLevelComma(allocator, rest);
+        defer allocator.free(args);
+        if (args.len != 3) return null;
+        const parsed = parseTypeText(args[1]) orelse return null;
+        return parsed.ty;
+    }
+    if (std.mem.eql(u8, op, "call") or std.mem.indexOf(u8, rhs, " call ") != null) {
+        const call_idx = std.mem.indexOf(u8, rhs, "call ") orelse return null;
+        const call_text = trim(rhs[call_idx + "call ".len ..]);
+        const at = std.mem.indexOfScalar(u8, call_text, '@') orelse return null;
+        const prefix = trim(call_text[0..at]);
+        if (std.mem.indexOfScalar(u8, prefix, '{')) |brace| {
+            const parsed = parseTypeText(prefix[brace..]) orelse return null;
+            return parsed.ty;
+        }
+        var last: ?[]const u8 = null;
+        var parts = std.mem.tokenizeAny(u8, prefix, " \t\r\n");
+        while (parts.next()) |part| {
+            if (typeTokenToSa(part) != null) last = part;
+        }
+        return last;
+    }
+    if (std.mem.eql(u8, op, "extractvalue")) {
+        const parsed = parseTypeText(rest) orelse return null;
+        return parsed.ty;
+    }
+    const is_cast = std.mem.eql(u8, op, "trunc") or std.mem.eql(u8, op, "zext") or std.mem.eql(u8, op, "sext") or std.mem.eql(u8, op, "bitcast") or std.mem.eql(u8, op, "inttoptr") or std.mem.eql(u8, op, "ptrtoint") or std.mem.eql(u8, op, "fptosi") or std.mem.eql(u8, op, "fptoui") or std.mem.eql(u8, op, "sitofp") or std.mem.eql(u8, op, "uitofp");
+    if (is_cast) {
+        const to_idx = std.mem.lastIndexOf(u8, rest, " to ") orelse return null;
+        const parsed = parseTypeText(rest[to_idx + 4 ..]) orelse return null;
+        return parsed.ty;
+    }
+    const body = if (llvmBinaryOpToSa(op) != null) skipOverflowFlags(rest) else rest;
+    const parsed = parseTypeText(body) orelse return null;
+    return parsed.ty;
+}
+
+/// Two-pass analysis: record every SSA definition (name -> type, home
+/// block), then mark definitions whose uses span foreign blocks as
+/// cross-block (slot-backed). Phi incoming values count as uses in the
+/// named predecessor block.
+fn analyzeCrossBlockValues(ctx: *FnCtx, body: []const []const u8) !void {
+    const allocator = ctx.allocator;
+    var block: []const u8 = "entry";
+    for (body) |raw_line| {
+        const line = trim(raw_line);
+        if (line.len == 0) continue;
+        if (std.mem.endsWith(u8, line, ":")) {
+            block = line[0 .. line.len - 1];
+            continue;
+        }
+        const name = defLhsName(line) orelse continue;
+        // alloca results are stack_alloc slot pointers: function-level by
+        // SA's own rules, already legal in every block. Slotting them
+        // would *redefine* the pointer register in foreign blocks and
+        // trap RegisterRedefinition (fnv1a_stream's %buf, probe M2 case).
+        {
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            var rhs_words = std.mem.tokenizeAny(u8, trim(line[eq + 1 ..]), " \t\r\n");
+            if (rhs_words.next()) |op| {
+                if (std.mem.eql(u8, op, "alloca")) continue;
+            }
+        }
+        const ty = (try resultTypeOfDef(allocator, line)) orelse continue;
+        if (isAggType(ty)) continue;
+        if (typeBytes(ty) == null or typeTokenToSa(ty) == null) continue;
+        try ctx.defs.put(allocator, name, .{ .ty = ty, .home = block, .is_phi = isPhiInstruction(line) });
+    }
+
+    block = "entry";
+    for (body) |raw_line| {
+        const line = trim(raw_line);
+        if (line.len == 0) continue;
+        if (std.mem.endsWith(u8, line, ":")) {
+            block = line[0 .. line.len - 1];
+            continue;
+        }
+        if (isPhiInstruction(line)) {
+            const phi = try parsePhi(allocator, line);
+            defer allocator.free(phi.incoming);
+            for (phi.incoming) |incoming_text| {
+                const pair_text = trim(incoming_text);
+                if (pair_text.len < 2 or pair_text[0] != '[' or pair_text[pair_text.len - 1] != ']') continue;
+                const pair = try splitTopLevelComma(allocator, pair_text[1 .. pair_text.len - 1]);
+                defer allocator.free(pair);
+                if (pair.len != 2) continue;
+                const pred = trim(stripLlvmSigil(llvmTypedValueToValue(pair[1])));
+                var names = std.array_list.Managed([]const u8).init(allocator);
+                defer names.deinit();
+                try scanValueNames(pair[0], &names);
+                for (names.items) |name| try markUse(ctx, name, pred);
+            }
+            continue;
+        }
+        var names = std.array_list.Managed([]const u8).init(allocator);
+        defer names.deinit();
+        try scanValueNames(line, &names);
+        const lhs = defLhsName(line);
+        for (names.items) |name| {
+            if (lhs) |l| {
+                if (std.mem.eql(u8, l, name)) continue;
+            }
+            try markUse(ctx, name, block);
+        }
+    }
+}
+
+fn markUse(ctx: *FnCtx, name: []const u8, use_block: []const u8) !void {
+    const def = ctx.defs.get(name) orelse return;
+    if (!std.mem.eql(u8, def.home, use_block)) {
+        try ctx.cross.put(ctx.allocator, name, true);
+    }
+}
+
+fn appendCrossBlockSlots(out: *std.array_list.Managed(u8), ctx: *FnCtx) !void {
+    var it = ctx.cross.keyIterator();
+    while (it.next()) |key| {
+        const name = key.*;
+        const def = ctx.defs.get(name) orelse continue;
+        if (def.is_phi) continue; // phi values already own a phi slot
+        const size = typeBytes(def.ty) orelse continue;
+        const slot = try ctx.slotName(name, def);
+        defer ctx.allocator.free(slot);
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
+    }
+}
+
 fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, header: []const u8, body: []const []const u8) !void {
     try appendFunctionHeader(out, allocator, header, false);
 
     var phi_lines = std.array_list.Managed([]const u8).init(allocator);
     defer phi_lines.deinit();
     for (body) |line| if (isPhiInstruction(line)) try phi_lines.append(line);
+
+    var ctx = FnCtx{ .allocator = allocator };
+    defer ctx.deinit();
+    try analyzeCrossBlockValues(&ctx, body);
 
     var switch_text = std.array_list.Managed(u8).init(allocator);
     defer switch_text.deinit();
@@ -936,6 +1236,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             try switch_text.appendSlice(line);
             try switch_text.append('\n');
             if (std.mem.indexOfScalar(u8, line, ']') != null) {
+                try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
                 try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
                 try appendSwitch(out, allocator, switch_text.items, switch_id);
                 switch_id += 1;
@@ -947,9 +1248,12 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
         if (std.mem.endsWith(u8, line, ":")) {
             try appendLabel(out, allocator, line[0 .. line.len - 1]);
             current_block = line[0 .. line.len - 1];
+            ctx.current_block = current_block;
+            ctx.reloaded.clearRetainingCapacity();
             need_entry_label = false;
             if (!phi_slots_emitted) {
                 try appendPhiSlots(out, allocator, phi_lines.items);
+                try appendCrossBlockSlots(out, &ctx);
                 phi_slots_emitted = true;
             }
             continue;
@@ -957,14 +1261,17 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
         if (need_entry_label) {
             try out.appendSlice("L_ENTRY:\n");
             try appendPhiSlots(out, allocator, phi_lines.items);
+            try appendCrossBlockSlots(out, &ctx);
             phi_slots_emitted = true;
             need_entry_label = false;
         }
         if (startsWithWord(line, "switch")) {
+            try ctx.emitReloadsForLine(out, line, false);
             switch_text.clearRetainingCapacity();
             try switch_text.appendSlice(line);
             try switch_text.append('\n');
             if (std.mem.indexOfScalar(u8, line, ']') != null) {
+                try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
                 try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
                 try appendSwitch(out, allocator, switch_text.items, switch_id);
                 switch_id += 1;
@@ -975,12 +1282,34 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             continue;
         }
         if (startsWithWord(line, "br") or startsWithWord(line, "ret")) {
+            try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
+            try ctx.emitReloadsForLine(out, line, false);
             try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+        } else if (!isPhiInstruction(line)) {
+            try ctx.emitReloadsForLine(out, line, true);
         }
         if (isPhiInstruction(line)) {
             try appendPhiLoad(out, allocator, line);
         } else {
-            try appendInstruction(out, allocator, line);
+            try appendInstruction(out, allocator, line, &ctx);
+        }
+        // A cross-block definition is complete: publish it to its slot so
+        // foreign blocks can reload it. (Phi loads already read their slot.)
+        if (!isPhiInstruction(line)) {
+            if (defLhsName(line)) |name| {
+                if (ctx.isCross(name)) {
+                    if (ctx.defs.get(name)) |def| {
+                        if (std.mem.eql(u8, def.home, current_block)) {
+                            const sa_ty = typeTokenToSa(def.ty) orelse return error.UnsupportedInstruction;
+                            const slot = try ctx.slotName(name, def);
+                            defer allocator.free(slot);
+                            const san = try sanitizeIdent(allocator, name, "r");
+                            defer allocator.free(san);
+                            try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ slot, san, sa_ty });
+                        }
+                    }
+                }
+            }
         }
     }
     if (pending_switch) return error.InvalidIr;
@@ -1050,7 +1379,8 @@ fn appendCall(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
     try out.appendSlice(")\n");
 }
 
-fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8) !void {
+fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8, ctx: *FnCtx) !void {
+    _ = ctx;
     var words = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
     const op = words.next() orelse return error.InvalidIr;
     const rest_start = std.mem.indexOf(u8, rhs, op) orelse return error.InvalidIr;
@@ -1073,7 +1403,7 @@ fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.
     return error.UnsupportedInstruction;
 }
 
-fn appendInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, line: []const u8) !void {
+fn appendInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, line: []const u8, ctx: *FnCtx) !void {
     const cleaned = cleanInstructionLine(line);
     const t = trim(cleaned);
     if (t.len == 0) return;
@@ -1081,7 +1411,7 @@ fn appendInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Alloca
     if (std.mem.indexOfScalar(u8, t, '=')) |eq_idx| {
         const lhs = trim(t[0..eq_idx]);
         const rhs = trim(t[eq_idx + 1 ..]);
-        return appendAssignmentInstruction(out, allocator, lhs, rhs);
+        return appendAssignmentInstruction(out, allocator, lhs, rhs, ctx);
     }
 
     if (startsWithWord(t, "ret")) return appendReturn(out, allocator, t["ret".len..]);
@@ -1723,6 +2053,59 @@ test "bc2sa disassembly report lists every candidate failure" {
     const report = lastDisassemblyFailure();
     try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/false: exit 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/true: exit 0 but produced no output"));
+}
+
+test "bc2sa phi cross-block uses reload from slots (M1 and M2)" {
+    // M2 (probe REPORT.md ruling 1): a phi result loaded once in the loop
+    // header and reused in the latch/exit blocks was rejected by the SA
+    // referee (UnknownRegister). The latch and exit blocks must each
+    // re-declare the register from the phi slot.
+    const m2 =
+        \\define i32 @m2(i32 %n) {
+        \\entry:
+        \\  br label %head
+        \\head:
+        \\  %i = phi i32 [ 0, %entry ], [ %inc, %latch ]
+        \\  %c = icmp slt i32 %i, %n
+        \\  br i1 %c, label %latch, label %exit
+        \\latch:
+        \\  %inc = add i32 %i, 1
+        \\  br label %head
+        \\exit:
+        \\  ret i32 %i
+        \\}
+        \\
+    ;
+    const out2 = try translateIrSource(std.testing.allocator, m2);
+    defer std.testing.allocator.free(out2);
+    // header load + latch reload + exit reload of the phi register
+    try std.testing.expect(std.mem.containsAtLeast(u8, out2, 3, "i = load bc2sa_phi_slot_i+0 as i32"));
+
+    // M1: a phi edge store emitted into predecessor %edge references %t,
+    // which is defined in %bb2 (not the direct predecessor). %t must be
+    // slot-published at its definition and reloaded on the edge.
+    const m1 =
+        \\define i32 @m1(i32 %n) {
+        \\entry:
+        \\  br label %bb2
+        \\bb2:
+        \\  %t = mul i32 %n, 3
+        \\  %c = icmp sgt i32 %n, 0
+        \\  br i1 %c, label %edge, label %join
+        \\edge:
+        \\  br label %join
+        \\join:
+        \\  %r = phi i32 [ %t, %edge ], [ 0, %bb2 ]
+        \\  ret i32 %r
+        \\}
+        \\
+    ;
+    const out1 = try translateIrSource(std.testing.allocator, m1);
+    defer std.testing.allocator.free(out1);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "bc2sa_xslot_t = stack_alloc 4"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "store bc2sa_xslot_t+0, t as i32"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "t = load bc2sa_xslot_t+0 as i32"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "store bc2sa_phi_slot_r+0, t as i32"));
 }
 
 test "bc2sa normalization rewrites the four dialect-drift classes" {
