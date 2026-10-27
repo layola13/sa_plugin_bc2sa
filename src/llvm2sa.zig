@@ -43,6 +43,10 @@ fn trim(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
 }
 
+fn isHexDigit(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
 fn startsWithWord(text: []const u8, word: []const u8) bool {
     if (!std.mem.startsWith(u8, text, word)) return false;
     if (text.len == word.len) return true;
@@ -1169,11 +1173,125 @@ fn appendConstDecl(out: *std.array_list.Managed(u8), allocator: std.mem.Allocato
     return true;
 }
 
+/// IR text normalization layer (probe REPORT.md, ruling 3, classes 1-4).
+///
+/// Placement decision: this lives in the translator itself, at the single
+/// funnel both entry points share (`translateIrSource`, reached by the
+/// bitcode path after disassembly and by direct IR callers). The dialect
+/// drift comes from the *disassembler's* LLVM version, so normalizing in a
+/// driver script would leave library/plugin users exposed to whichever
+/// llvm-dis happens to be installed; normalizing here makes the parser's
+/// accepted dialect independent of the tool that produced the text.
+///
+/// Four rewrites, each semantics-preserving by construction:
+///  1. `icmp samesign <pred>` -> `icmp <pred>` (samesign is an LLVM 18+
+///     printing flag asserting a proof obligation the comparison opcode
+///     does not depend on; SA icmp has no such flag).
+///  2. Trailing instruction metadata suffixes (`, !llvm.loop !N`,
+///     `, !range !N`, stacked in any order) stripped to a fixpoint.
+///     Metadata is annotation-only in LLVM; only whole suffixes at end of
+///     indented instruction lines are removed.
+///  3. `f0x<hex>` float literals -> decimal. 16 hex digits are f64 bits,
+///     8 are f32 bits; the conversion is bit-exact. Skipped inside `c"..."`
+///     string constants and for non-finite values.
+///  4. `llvm.experimental.noalias.scope.decl` declare/call lines dropped:
+///     an annotation-only intrinsic with no execution semantics whose
+///     `metadata` operand type the parser cannot represent.
+pub fn normalizeIrSource(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var first = true;
+    while (lines.next()) |raw_line| {
+        if (!first) try out.append('\n');
+        first = false;
+        if (std.mem.indexOf(u8, raw_line, "llvm.experimental.noalias.scope.decl") != null) continue;
+        const trimmed = trim(raw_line);
+        if (trimmed.len == 0 or trimmed[0] == ';') {
+            try out.appendSlice(raw_line);
+            continue;
+        }
+        var line = raw_line;
+        var owned_line: ?[]u8 = null;
+        defer if (owned_line) |buf| allocator.free(buf);
+        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+            if (std.mem.indexOf(u8, line, "icmp samesign ") != null) {
+                owned_line = try std.mem.replaceOwned(u8, allocator, line, "icmp samesign ", "icmp ");
+                line = owned_line.?;
+            }
+            line = stripTrailingMetadataSuffix(line);
+        }
+        if (std.mem.indexOf(u8, line, " c\"") == null) {
+            try appendHexFloatNormalized(&out, line);
+        } else {
+            try out.appendSlice(line);
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn stripTrailingMetadataSuffix(line: []const u8) []const u8 {
+    var t = std.mem.trimEnd(u8, line, " \t\r");
+    while (true) {
+        const idx = std.mem.lastIndexOf(u8, t, ", !") orelse return t;
+        const tail = t[idx + 3 ..];
+        // tail must be exactly: <metadata-name> " !" <node-number>
+        var i: usize = 0;
+        while (i < tail.len and (isIdentChar(tail[i]) or tail[i] == '.')) : (i += 1) {}
+        if (i == 0 or i >= tail.len or tail[i] != ' ') return t;
+        i += 1;
+        if (i >= tail.len or tail[i] != '!') return t;
+        i += 1;
+        const digits_start = i;
+        while (i < tail.len and std.ascii.isDigit(tail[i])) : (i += 1) {}
+        if (i != tail.len or i == digits_start) return t;
+        t = std.mem.trimEnd(u8, t[0..idx], " \t\r");
+    }
+}
+
+fn appendHexFloatNormalized(out: *std.array_list.Managed(u8), line: []const u8) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const is_token_start = i == 0 or !(isIdentChar(line[i - 1]) or line[i - 1] == '.');
+        if (is_token_start and i + 2 < line.len and line[i] == 'f' and line[i + 1] == '0' and line[i + 2] == 'x') {
+            var j = i + 3;
+            while (j < line.len and isHexDigit(line[j])) : (j += 1) {}
+            const digits = line[i + 3 .. j];
+            var replaced = false;
+            if (digits.len == 16) {
+                if (std.fmt.parseInt(u64, digits, 16)) |bits| {
+                    const v: f64 = @bitCast(bits);
+                    if (std.math.isFinite(v)) {
+                        try listPrint(out, "{d}", .{v});
+                        replaced = true;
+                    }
+                } else |_| {}
+            } else if (digits.len == 8) {
+                if (std.fmt.parseInt(u32, digits, 16)) |bits| {
+                    const v: f32 = @bitCast(bits);
+                    if (std.math.isFinite(v)) {
+                        try listPrint(out, "{d}", .{v});
+                        replaced = true;
+                    }
+                } else |_| {}
+            }
+            if (!replaced) try out.appendSlice(line[i..j]);
+            i = j;
+            continue;
+        }
+        try out.append(line[i]);
+        i += 1;
+    }
+}
+
 pub fn translateIrSource(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const normalized = try normalizeIrSource(allocator, source);
+    defer allocator.free(normalized);
+
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
 
-    var lines = std.mem.splitScalar(u8, source, '\n');
+    var lines = std.mem.splitScalar(u8, normalized, '\n');
     while (lines.next()) |raw_line| {
         const trimmed_line = trim(raw_line);
         if (trimmed_line.len == 0) continue;
@@ -1605,6 +1723,61 @@ test "bc2sa disassembly report lists every candidate failure" {
     const report = lastDisassemblyFailure();
     try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/false: exit 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/true: exit 0 but produced no output"));
+}
+
+test "bc2sa normalization rewrites the four dialect-drift classes" {
+    const src =
+        \\declare void @llvm.experimental.noalias.scope.decl(metadata)
+        \\define i32 @f(i32 %a) !guid !7 {
+        \\entry:
+        \\  %c = icmp samesign eq i32 %a, 0
+        \\  %r = fmul double 2.000000e+00, f0x400921FB54442D18
+        \\  call void @llvm.experimental.noalias.scope.decl(metadata !5)
+        \\  br i1 %c, label %ok, label %bad, !llvm.loop !4, !noalias !9
+        \\ok:
+        \\  ret i32 1
+        \\bad:
+        \\  ret i32 0
+        \\}
+        \\@msg = constant [5 x i8] c"f0x1\00"
+        \\
+    ;
+    const out = try normalizeIrSource(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // class 1: samesign flag dropped
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "%c = icmp eq i32 %a, 0"));
+    // class 2: stacked trailing metadata stripped to a fixpoint
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br i1 %c, label %ok, label %bad\n"));
+    // class 3: hex float literal converted bit-exactly (pi)
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "3.141592653589793"));
+    // class 4: noalias.scope.decl lines gone entirely
+    try std.testing.expect(!std.mem.containsAtLeast(u8, out, 1, "noalias.scope.decl"));
+    // negative: unindented define-line metadata is not ours to strip
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "define i32 @f(i32 %a) !guid !7 {"));
+    // negative: hex-looking bytes inside a string constant stay untouched
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "c\"f0x1\\00\""));
+}
+
+test "bc2sa translates samesign, loop metadata and hex float operands" {
+    // All three shapes returned error.UnsupportedInstruction pre-normalizer.
+    const ir =
+        \\define double @hf(double %a, i32 %n) {
+        \\entry:
+        \\  %c = icmp samesign sgt i32 %n, 0
+        \\  br i1 %c, label %pos, label %neg, !llvm.loop !2
+        \\pos:
+        \\  %r = fmul double %a, f0x400921FB54442D18
+        \\  ret double %r
+        \\neg:
+        \\  ret double %a
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "c = sgt n, 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "r = fmul a, 3.141592653589793"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "br c -> L_pos, L_neg"));
 }
 
 test "bc2sa disassembly distinguishes no candidate installed" {
