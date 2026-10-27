@@ -301,7 +301,101 @@ fn typeBytes(type_text: []const u8) ?u64 {
         return std.math.mul(u64, count, elem) catch null;
     }
 
+    if (t.len >= 2 and t[0] == '{' and t[t.len - 1] == '}') {
+        // Struct size needs the field layout (defined below); this
+        // function's signature has no allocator, so compute the layout
+        // with a scratch arena.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const layout = (aggLayout(arena.allocator(), t) catch return null) orelse return null;
+        return layout.size;
+    }
+
     return null;
+}
+
+fn alignUp(value: u64, alignment: u64) u64 {
+    if (alignment <= 1) return value;
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+fn aggAlign(ty_text: []const u8) u64 {
+    const t = trim(ty_text);
+    if (t.len > 0 and t[0] == '{') {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const layout = (aggLayout(arena.allocator(), t) catch return 8) orelse return 8;
+        return layout.@"align";
+    }
+    if (t.len > 0 and t[0] == '[') {
+        const body = trim(t[1 .. t.len - 1]);
+        const x_idx = std.mem.indexOf(u8, body, " x ") orelse return 8;
+        return aggAlign(body[x_idx + 3 ..]);
+    }
+    return @min(typeBytes(t) orelse 8, 8);
+}
+
+const AggField = struct { ty: []const u8, offset: u64 };
+const AggLayout = struct {
+    fields: std.array_list.Managed(AggField),
+    size: u64,
+    @"align": u64,
+};
+
+/// LLVM struct layout: fields in order, each aligned to its natural
+/// alignment, struct size rounded up to the largest field alignment.
+/// (Packed structs `<{ ... }>` are not produced by rustc for the value
+/// types in scope and stay unsupported.)
+fn aggLayout(allocator: std.mem.Allocator, ty_text: []const u8) !?AggLayout {
+    const t = trim(ty_text);
+    if (t.len < 2 or t[0] != '{' or t[t.len - 1] != '}') return null;
+    var fields = std.array_list.Managed(AggField).init(allocator);
+    errdefer fields.deinit();
+    const inner = trim(t[1 .. t.len - 1]);
+    if (inner.len == 0) return .{ .fields = fields, .size = 0, .@"align" = 1 };
+    const field_texts = try splitTopLevelComma(allocator, inner);
+    defer allocator.free(field_texts);
+    var cur: u64 = 0;
+    var max_align: u64 = 1;
+    for (field_texts) |field_text| {
+        const fty = trim(field_text);
+        const fsize = typeBytes(fty) orelse return null;
+        const falign = aggAlign(fty);
+        const off = alignUp(cur, falign);
+        try fields.append(.{ .ty = fty, .offset = off });
+        cur = off + fsize;
+        if (falign > max_align) max_align = falign;
+    }
+    return .{ .fields = fields, .size = alignUp(cur, max_align), .@"align" = max_align };
+}
+
+/// Walk a constant index path into an aggregate type: returns the byte
+/// offset and the resulting (sub-)type.
+fn walkAggPath(allocator: std.mem.Allocator, ty_text: []const u8, indices: []const u64) !?struct { offset: u64, ty: []const u8 } {
+    var cur_ty = trim(ty_text);
+    var off: u64 = 0;
+    for (indices) |idx| {
+        if (cur_ty.len > 0 and cur_ty[0] == '{') {
+            var layout = (try aggLayout(allocator, cur_ty)) orelse return null;
+            defer layout.fields.deinit();
+            if (idx >= layout.fields.items.len) return null;
+            const field = layout.fields.items[@intCast(idx)];
+            off += field.offset;
+            cur_ty = field.ty;
+        } else if (cur_ty.len > 0 and cur_ty[0] == '[') {
+            const body = trim(cur_ty[1 .. cur_ty.len - 1]);
+            const x_idx = std.mem.indexOf(u8, body, " x ") orelse return null;
+            const count = std.fmt.parseInt(u64, trim(body[0..x_idx]), 10) catch return null;
+            if (idx >= count) return null;
+            const elem = trim(body[x_idx + 3 ..]);
+            const esize = typeBytes(elem) orelse return null;
+            off += idx * esize;
+            cur_ty = elem;
+        } else {
+            return null;
+        }
+    }
+    return .{ .offset = off, .ty = cur_ty };
 }
 
 fn arrayBoundFromType(type_text: []const u8) ?u64 {
@@ -351,6 +445,20 @@ fn llvmTypedValueToValue(text: []const u8) []const u8 {
 fn saValue(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var value = trim(raw);
     value = trim(std.mem.trimEnd(u8, value, ","));
+
+    // Constant expressions inttoptr/ptrtoint used as operands (the
+    // empty-Vec dangling pointer `inttoptr (i64 8 to ptr)` is the probe
+    // case): the cast is the identity on the operand value in SA's flat
+    // register model, so reduce to the operand itself. The expression
+    // may sit behind a type token (`ptr inttoptr (i64 8 to ptr)`).
+    if (std.mem.indexOf(u8, value, "inttoptr (") != null or std.mem.indexOf(u8, value, "ptrtoint (") != null) {
+        const start = std.mem.indexOf(u8, value, "inttoptr (") orelse std.mem.indexOf(u8, value, "ptrtoint (").?;
+        const expr = value[start..];
+        const open = std.mem.indexOfScalar(u8, expr, '(').?;
+        const inner = expr[open + 1 ..];
+        const to_idx = std.mem.lastIndexOf(u8, inner, " to ") orelse return error.UnsupportedInstruction;
+        return saValue(allocator, inner[0..to_idx]);
+    }
     value = llvmTypedValueToValue(value);
 
     if (value.len == 0) return error.InvalidIr;
@@ -360,7 +468,9 @@ fn saValue(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         defer allocator.free(name);
         return try std.fmt.allocPrint(allocator, "&{s}", .{name});
     }
-    if (std.mem.eql(u8, value, "null") or std.mem.eql(u8, value, "zeroinitializer")) return try allocator.dupe(u8, "0");
+    // `undef` is poison: any value is a legal refinement; 0 is the
+    // canonical choice (phi incoming edges are the common case).
+    if (std.mem.eql(u8, value, "null") or std.mem.eql(u8, value, "zeroinitializer") or std.mem.eql(u8, value, "undef")) return try allocator.dupe(u8, "0");
     if (std.mem.eql(u8, value, "true")) return try allocator.dupe(u8, "1");
     if (std.mem.eql(u8, value, "false")) return try allocator.dupe(u8, "0");
     if (std.fmt.parseInt(i64, value, 10)) |_| return try allocator.dupe(u8, value) else |_| {}
@@ -405,6 +515,21 @@ fn appendValue(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, v
 }
 
 fn parseParam(allocator: std.mem.Allocator, fragment: []const u8, index: usize) !struct { name: []u8, ty: []const u8 } {
+    // Aggregate-typed parameters are passed as a pointer to the value's
+    // slot memory (see the aggregate slot model at appendExtractValue):
+    // the SA parameter is the slot address, typed ptr.
+    if (isAggType(fragment)) {
+        var name_token2: ?[]const u8 = null;
+        var parts2 = std.mem.tokenizeAny(u8, fragment, " \t\r\n");
+        while (parts2.next()) |part| {
+            if (std.mem.startsWith(u8, part, "%")) name_token2 = part;
+        }
+        const name2 = if (name_token2) |token|
+            try sanitizeIdent(allocator, token, "arg")
+        else
+            try std.fmt.allocPrint(allocator, "arg{d}", .{index});
+        return .{ .name = name2, .ty = "ptr" };
+    }
     const ty_token = firstTypeToken(fragment) orelse return error.UnsupportedInstruction;
     const ty = typeTokenToSa(ty_token) orelse return error.UnsupportedInstruction;
 
@@ -434,13 +559,32 @@ fn appendParamList(out: *std.array_list.Managed(u8), allocator: std.mem.Allocato
     }
 }
 
+/// If the header prefix (everything before the `@name`) ends with an
+/// aggregate type, that aggregate is the return type.
+fn aggRetFromPrefix(prefix: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    var found: ?[]const u8 = null;
+    while (i < prefix.len) : (i += 1) {
+        if (prefix[i] == '{' or prefix[i] == '[') {
+            if (parseTypeText(prefix[i..])) |parsed| {
+                if (trim(parsed.rest).len == 0) found = parsed.ty;
+            }
+        }
+    }
+    return found;
+}
+
 fn appendFunctionHeader(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, line: []const u8, is_declare: bool) !void {
     const keyword = if (is_declare) "declare" else "define";
     if (!startsWithWord(line, keyword)) return error.InvalidIr;
 
     const at = std.mem.indexOfScalar(u8, line, '@') orelse return error.InvalidIr;
     const prefix = trim(line[keyword.len..at]);
-    const ret_ty = try returnTypeFromPrefix(prefix);
+    // Aggregate returns use the sret convention: the header gains a
+    // hidden first parameter `bc2sa_sret: ptr` (address of the caller's
+    // result slot) and the SA return type becomes void.
+    const agg_ret = aggRetFromPrefix(prefix);
+    const ret_ty: ?[]const u8 = if (agg_ret == null) try returnTypeFromPrefix(prefix) else null;
 
     const after_at = line[at..];
     const open_rel = std.mem.indexOfScalar(u8, after_at, '(') orelse return error.InvalidIr;
@@ -455,10 +599,16 @@ fn appendFunctionHeader(out: *std.array_list.Managed(u8), allocator: std.mem.All
     } else {
         try listPrint(out, "@export {s}(", .{name});
     }
+    if (agg_ret != null) {
+        try out.appendSlice("bc2sa_sret: ptr");
+        if (trim(line[open + 1 .. close]).len > 0) try out.appendSlice(", ");
+    }
     try appendParamList(out, allocator, line[open + 1 .. close]);
     try out.append(')');
-    if (!std.mem.eql(u8, ret_ty, "void")) {
-        try listPrint(out, " -> {s}", .{ret_ty});
+    if (ret_ty) |rt| {
+        if (!std.mem.eql(u8, rt, "void")) {
+            try listPrint(out, " -> {s}", .{rt});
+        }
     }
     if (!is_declare) try out.append(':');
     try out.append('\n');
@@ -559,8 +709,8 @@ fn appendIcmp(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
 }
 
 fn appendAlloca(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8) !void {
-    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-    const alloc_ty = trim(rest[0..comma]);
+    const parsed = parseTypeText(rest) orelse return error.UnsupportedInstruction;
+    const alloc_ty = parsed.ty;
     if (std.mem.indexOfScalar(u8, alloc_ty, '%') != null) return error.UnsupportedInstruction;
     const size = typeBytes(alloc_ty) orelse return error.UnsupportedInstruction;
     const dst = try sanitizeIdent(allocator, lhs, "r");
@@ -568,10 +718,22 @@ fn appendAlloca(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, 
     try listPrint(out, "  {s} = stack_alloc {d}\n", .{ dst, size });
 }
 
-fn appendLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8) !void {
+fn appendLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8, ctx: *FnCtx) !void {
     const args = try splitTopLevelComma(allocator, rest);
     defer allocator.free(args);
     if (args.len < 2) return error.UnsupportedInstruction;
+
+    if (isAggType(args[0])) {
+        const parsed = parseTypeText(args[0]) orelse return error.UnsupportedInstruction;
+        const size = typeBytes(parsed.ty) orelse return error.UnsupportedInstruction;
+        const base = try saValue(allocator, args[1]);
+        defer allocator.free(base);
+        const slot = try aggSlotName(allocator, lhs);
+        defer allocator.free(slot);
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
+        try emitAggCopyAt(out, allocator, ctx, slot, base, parsed.ty);
+        return;
+    }
 
     const value_ty = firstTypeToken(args[0]) orelse return error.UnsupportedInstruction;
     const sa_ty = typeTokenToSa(value_ty) orelse return error.UnsupportedInstruction;
@@ -582,10 +744,18 @@ fn appendLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
     try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ dst, base, sa_ty });
 }
 
-fn appendStore(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, rest: []const u8) !void {
+fn appendStore(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, rest: []const u8, ctx: *FnCtx) !void {
     const args = try splitTopLevelComma(allocator, rest);
     defer allocator.free(args);
     if (args.len < 2) return error.UnsupportedInstruction;
+
+    const parsed0 = parseTypeText(args[0]) orelse return error.UnsupportedInstruction;
+    if (isAggType(parsed0.ty)) {
+        const base = try saValue(allocator, args[1]);
+        defer allocator.free(base);
+        try emitAggValueTo(out, allocator, ctx, base, parsed0.rest, parsed0.ty);
+        return;
+    }
 
     const value_ty = firstTypeToken(args[0]) orelse return error.UnsupportedInstruction;
     const sa_ty = typeTokenToSa(value_ty) orelse return error.UnsupportedInstruction;
@@ -617,9 +787,17 @@ fn appendBranch(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, 
     try listPrint(out, "  br {s} -> {s}, {s}\n", .{ cond, true_label, false_label });
 }
 
-fn appendReturn(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, rest: []const u8) !void {
+fn appendReturn(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, rest: []const u8, ctx: *FnCtx) !void {
     const t = trim(rest);
     if (std.mem.eql(u8, t, "void") or t.len == 0) {
+        try out.appendSlice("  return\n");
+        return;
+    }
+    if (ctx.agg_ret_ty) |agg_ty| {
+        // sret: copy the returned aggregate into the caller's slot
+        // address held in bc2sa_sret, then return void.
+        const parsed = parseTypeText(t) orelse return error.UnsupportedInstruction;
+        try emitAggValueTo(out, allocator, ctx, "bc2sa_sret", parsed.rest, agg_ty);
         try out.appendSlice("  return\n");
         return;
     }
@@ -666,7 +844,11 @@ fn appendCast(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
             return;
         }
     }
-    try listPrint(out, "  {s} = {s} ", .{ dst, op });
+    // inttoptr/ptrtoint/addrspacecast are identity casts on SA's flat
+    // register values; SA spells them as bitcast (mirrors sci's own
+    // llvm2sa mapping).
+    const sa_op = if (std.mem.eql(u8, op, "inttoptr") or std.mem.eql(u8, op, "ptrtoint") or std.mem.eql(u8, op, "addrspacecast")) "bitcast" else op;
+    try listPrint(out, "  {s} = {s} ", .{ dst, sa_op });
     try appendValue(out, allocator, source);
     try listPrint(out, " as {s}\n", .{dest_ty});
 }
@@ -924,12 +1106,17 @@ fn phiSlotName(allocator: std.mem.Allocator, lhs: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "bc2sa_phi_slot_{s}", .{dst});
 }
 
+fn phiValueSlotName(allocator: std.mem.Allocator, lhs: []const u8, ty: []const u8) ![]u8 {
+    if (isAggType(ty)) return aggSlotName(allocator, lhs);
+    return phiSlotName(allocator, lhs);
+}
+
 fn appendPhiSlots(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, phi_lines: []const []const u8) !void {
     for (phi_lines) |phi_line| {
         const phi = try parsePhi(allocator, phi_line);
         defer allocator.free(phi.incoming);
         const size = typeBytes(phi.ty) orelse return error.UnsupportedPhi;
-        const slot = try phiSlotName(allocator, phi.lhs);
+        const slot = try phiValueSlotName(allocator, phi.lhs, phi.ty);
         defer allocator.free(slot);
         try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
     }
@@ -938,6 +1125,8 @@ fn appendPhiSlots(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator
 fn appendPhiLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, line: []const u8) !void {
     const phi = try parsePhi(allocator, line);
     defer allocator.free(phi.incoming);
+    // Aggregate phis live in their slot; there is no register to load.
+    if (isAggType(phi.ty)) return;
     const sa_ty = typeTokenToSa(phi.ty) orelse return error.UnsupportedPhi;
     const dst = try sanitizeIdent(allocator, phi.lhs, "r");
     defer allocator.free(dst);
@@ -946,12 +1135,13 @@ fn appendPhiLoad(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator,
     try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ dst, slot, sa_ty });
 }
 
-fn appendPhiStoresForBlock(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, phi_lines: []const []const u8, block: []const u8) !void {
+fn appendPhiStoresForBlock(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, phi_lines: []const []const u8, block: []const u8) !void {
     for (phi_lines) |phi_line| {
         const phi = try parsePhi(allocator, phi_line);
         defer allocator.free(phi.incoming);
-        const sa_ty = typeTokenToSa(phi.ty) orelse return error.UnsupportedPhi;
-        const slot = try phiSlotName(allocator, phi.lhs);
+        const agg = isAggType(phi.ty);
+        const sa_ty: ?[]const u8 = if (agg) null else (typeTokenToSa(phi.ty) orelse return error.UnsupportedPhi);
+        const slot = try phiValueSlotName(allocator, phi.lhs, phi.ty);
         defer allocator.free(slot);
         for (phi.incoming) |incoming_text| {
             const pair_text = trim(incoming_text);
@@ -961,9 +1151,13 @@ fn appendPhiStoresForBlock(out: *std.array_list.Managed(u8), allocator: std.mem.
             if (pair.len != 2) return error.UnsupportedPhi;
             const incoming_block = stripLlvmSigil(llvmTypedValueToValue(pair[1]));
             if (!std.mem.eql(u8, trim(incoming_block), trim(block))) continue;
-            const value = try saValue(allocator, pair[0]);
-            defer allocator.free(value);
-            try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ slot, value, sa_ty });
+            if (agg) {
+                try emitAggValueTo(out, allocator, ctx, slot, pair[0], phi.ty);
+            } else {
+                const value = try saValue(allocator, pair[0]);
+                defer allocator.free(value);
+                try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ slot, value, sa_ty.? });
+            }
         }
     }
 }
@@ -992,6 +1186,12 @@ const ValueDef = struct {
     is_phi: bool,
 };
 
+const AggParam = struct {
+    reg: []const u8,
+    ty: []const u8,
+    slot: []u8,
+};
+
 const FnCtx = struct {
     allocator: std.mem.Allocator,
     defs: std.StringHashMapUnmanaged(ValueDef) = .empty,
@@ -999,11 +1199,23 @@ const FnCtx = struct {
     reloaded: std.StringHashMapUnmanaged(bool) = .empty,
     current_block: []const u8 = "entry",
     agg_ret_ty: ?[]const u8 = null,
+    tmp_counter: usize = 0,
+    agg_params: [8]AggParam = undefined,
+    agg_param_count: usize = 0,
 
     fn deinit(self: *FnCtx) void {
         self.defs.deinit(self.allocator);
         self.cross.deinit(self.allocator);
         self.reloaded.deinit(self.allocator);
+        for (self.agg_params[0..self.agg_param_count]) |param| {
+            self.allocator.free(param.slot);
+            self.allocator.free(param.reg);
+        }
+    }
+
+    fn freshTmp(self: *FnCtx) ![]u8 {
+        self.tmp_counter += 1;
+        return try std.fmt.allocPrint(self.allocator, "bc2sa_t{d}", .{self.tmp_counter});
     }
 
     fn slotName(self: *FnCtx, name: []const u8, def: ValueDef) ![]u8 {
@@ -1069,6 +1281,310 @@ const FnCtx = struct {
         }
     }
 };
+
+/// Aggregate slot model: every LLVM aggregate-typed SSA value %x is
+/// materialized in memory at the stack slot `bc2sa_agg_x`; operations
+/// that produce or consume aggregates work field-by-field on that
+/// memory. Aggregate function returns use an sret convention (hidden
+/// first parameter `bc2sa_sret`), aggregate parameters are pointers to
+/// the caller's slot memory. This mirrors how the translator already
+/// lowers phi values into slots and keeps SA's flat register model.
+fn aggSlotName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const san = try sanitizeIdent(allocator, name, "r");
+    defer allocator.free(san);
+    return try std.fmt.allocPrint(allocator, "bc2sa_agg_{s}", .{san});
+}
+
+/// Returns a register holding `base + offset` (a fresh temp), or a copy
+/// of `base` itself when offset is 0. Caller frees the result.
+fn ptrAt(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, base: []const u8, offset: u64) ![]u8 {
+    if (offset == 0) return try allocator.dupe(u8, base);
+    const tmp = try ctx.freshTmp();
+    try listPrint(out, "  {s} = ptr_add {s}, {d}\n", .{ tmp, base, offset });
+    return tmp;
+}
+
+fn emitAggLeafCopy(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, dst_base: []const u8, src_base: []const u8, ty_text: []const u8) !void {
+    const sa_ty = typeTokenToSa(ty_text) orelse return error.UnsupportedInstruction;
+    const v = try ctx.freshTmp();
+    defer allocator.free(v);
+    try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ v, src_base, sa_ty });
+    try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ dst_base, v, sa_ty });
+}
+
+/// Field-wise copy of an aggregate value held in memory.
+fn emitAggCopyAt(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, dst_base: []const u8, src_base: []const u8, ty_text: []const u8) !void {
+    const t = trim(ty_text);
+    if (!isAggType(t)) {
+        try emitAggLeafCopy(out, allocator, ctx, dst_base, src_base, t);
+        return;
+    }
+    if (t[0] == '{') {
+        var layout = (try aggLayout(allocator, t)) orelse return error.UnsupportedInstruction;
+        defer layout.fields.deinit();
+        for (layout.fields.items) |field| {
+            const dptr = try ptrAt(out, allocator, ctx, dst_base, field.offset);
+            defer allocator.free(dptr);
+            const sptr = try ptrAt(out, allocator, ctx, src_base, field.offset);
+            defer allocator.free(sptr);
+            try emitAggCopyAt(out, allocator, ctx, dptr, sptr, field.ty);
+        }
+        return;
+    }
+    // [ N x T ]
+    const body = trim(t[1 .. t.len - 1]);
+    const x_idx = std.mem.indexOf(u8, body, " x ") orelse return error.UnsupportedInstruction;
+    const count = std.fmt.parseInt(u64, trim(body[0..x_idx]), 10) catch return error.UnsupportedInstruction;
+    const elem = trim(body[x_idx + 3 ..]);
+    const esize = typeBytes(elem) orelse return error.UnsupportedInstruction;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const dptr = try ptrAt(out, allocator, ctx, dst_base, i * esize);
+        defer allocator.free(dptr);
+        const sptr = try ptrAt(out, allocator, ctx, src_base, i * esize);
+        defer allocator.free(sptr);
+        try emitAggCopyAt(out, allocator, ctx, dptr, sptr, elem);
+    }
+}
+
+fn emitAggZeroAt(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, base: []const u8, ty_text: []const u8) !void {
+    const t = trim(ty_text);
+    if (!isAggType(t)) {
+        const sa_ty = typeTokenToSa(t) orelse return error.UnsupportedInstruction;
+        try listPrint(out, "  store {s}+0, 0 as {s}\n", .{ base, sa_ty });
+        return;
+    }
+    if (t[0] == '{') {
+        var layout = (try aggLayout(allocator, t)) orelse return error.UnsupportedInstruction;
+        defer layout.fields.deinit();
+        for (layout.fields.items) |field| {
+            const ptr = try ptrAt(out, allocator, ctx, base, field.offset);
+            defer allocator.free(ptr);
+            try emitAggZeroAt(out, allocator, ctx, ptr, field.ty);
+        }
+        return;
+    }
+    const body = trim(t[1 .. t.len - 1]);
+    const x_idx = std.mem.indexOf(u8, body, " x ") orelse return error.UnsupportedInstruction;
+    const count = std.fmt.parseInt(u64, trim(body[0..x_idx]), 10) catch return error.UnsupportedInstruction;
+    const elem = trim(body[x_idx + 3 ..]);
+    const esize = typeBytes(elem) orelse return error.UnsupportedInstruction;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const ptr = try ptrAt(out, allocator, ctx, base, i * esize);
+        defer allocator.free(ptr);
+        try emitAggZeroAt(out, allocator, ctx, ptr, elem);
+    }
+}
+
+/// An aggregate constant may be printed bare (`{ i64 1, i1 true }`) or,
+/// for nested arrays, prefixed by its type (`[4 x i8] [i8 1, ...]`).
+/// Returns the bare constant body.
+fn stripAggConstTypePrefix(const_text: []const u8) []const u8 {
+    const ct = trim(const_text);
+    if (ct.len > 0 and (ct[0] == '[' or ct[0] == '%')) {
+        if (parseTypeText(ct)) |parsed| {
+            const rest = trim(parsed.rest);
+            if (rest.len > 0 and (rest[0] == '{' or rest[0] == '[')) return rest;
+        }
+    }
+    return ct;
+}
+
+fn emitAggConstInitAt(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, base: []const u8, const_text: []const u8, ty_text: []const u8) !void {
+    const t = trim(ty_text);
+    const ct = stripAggConstTypePrefix(const_text);
+    if (std.mem.eql(u8, ct, "zeroinitializer")) {
+        try emitAggZeroAt(out, allocator, ctx, base, t);
+        return;
+    }
+    if (std.mem.eql(u8, ct, "undef")) return;
+    if (!isAggType(t)) {
+        const sa_ty = typeTokenToSa(t) orelse return error.UnsupportedInstruction;
+        const value = try saValue(allocator, ct);
+        defer allocator.free(value);
+        try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ base, value, sa_ty });
+        return;
+    }
+    if (ct.len < 2 or (ct[0] != '{' and ct[0] != '[')) return error.UnsupportedInstruction;
+    const open_ch: u8 = ct[0];
+    const close_ch: u8 = if (open_ch == '{') '}' else ']';
+    const close = findMatching(ct, 0, open_ch, close_ch) orelse return error.UnsupportedInstruction;
+    const inner = trim(ct[1..close]);
+    const field_texts = try splitTopLevelComma(allocator, inner);
+    defer allocator.free(field_texts);
+    if (t[0] == '{') {
+        var layout = (try aggLayout(allocator, t)) orelse return error.UnsupportedInstruction;
+        defer layout.fields.deinit();
+        if (field_texts.len != layout.fields.items.len) return error.UnsupportedInstruction;
+        for (layout.fields.items, field_texts) |field, ftext| {
+            const ptr = try ptrAt(out, allocator, ctx, base, field.offset);
+            defer allocator.free(ptr);
+            try emitAggConstInitAt(out, allocator, ctx, ptr, ftext, field.ty);
+        }
+        return;
+    }
+    const body = trim(t[1 .. t.len - 1]);
+    const x_idx = std.mem.indexOf(u8, body, " x ") orelse return error.UnsupportedInstruction;
+    const count = std.fmt.parseInt(u64, trim(body[0..x_idx]), 10) catch return error.UnsupportedInstruction;
+    const elem = trim(body[x_idx + 3 ..]);
+    const esize = typeBytes(elem) orelse return error.UnsupportedInstruction;
+    if (field_texts.len != count) return error.UnsupportedInstruction;
+    for (field_texts, 0..) |ftext, i| {
+        const ptr = try ptrAt(out, allocator, ctx, base, @as(u64, @intCast(i)) * esize);
+        defer allocator.free(ptr);
+        try emitAggConstInitAt(out, allocator, ctx, ptr, ftext, elem);
+    }
+}
+
+/// Materialize an aggregate value (register slot / zero / constant) into
+/// the memory at `dst_base`.
+fn emitAggValueTo(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx, dst_base: []const u8, value_text: []const u8, ty_text: []const u8) !void {
+    const v = trim(value_text);
+    if (std.mem.startsWith(u8, v, "%")) {
+        const slot = try aggSlotName(allocator, v);
+        defer allocator.free(slot);
+        try emitAggCopyAt(out, allocator, ctx, dst_base, slot, ty_text);
+        return;
+    }
+    if (std.mem.startsWith(u8, v, "@")) {
+        const base = try saValue(allocator, v);
+        defer allocator.free(base);
+        try emitAggCopyAt(out, allocator, ctx, dst_base, base, ty_text);
+        return;
+    }
+    if (std.mem.eql(u8, v, "zeroinitializer")) {
+        try emitAggZeroAt(out, allocator, ctx, dst_base, ty_text);
+        return;
+    }
+    if (std.mem.eql(u8, v, "undef")) return;
+    try emitAggConstInitAt(out, allocator, ctx, dst_base, v, ty_text);
+}
+
+fn parseIndexList(allocator: std.mem.Allocator, texts: []const []const u8) ![]u64 {
+    const indices = try allocator.alloc(u64, texts.len);
+    errdefer allocator.free(indices);
+    for (texts, 0..) |text, i| {
+        indices[i] = std.fmt.parseInt(u64, trim(text), 10) catch return error.UnsupportedInstruction;
+    }
+    return indices;
+}
+
+fn appendExtractValue(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8, ctx: *FnCtx) !void {
+    const parsed = parseTypeText(rest) orelse return error.UnsupportedInstruction;
+    if (!isAggType(parsed.ty)) return error.UnsupportedInstruction;
+    const parts = try splitTopLevelComma(allocator, parsed.rest);
+    defer allocator.free(parts);
+    if (parts.len < 2) return error.UnsupportedInstruction;
+    const indices = try parseIndexList(allocator, parts[1..]);
+    defer allocator.free(indices);
+    const walked = (try walkAggPath(allocator, parsed.ty, indices)) orelse return error.UnsupportedInstruction;
+    const source = trim(parts[0]);
+
+    if (isAggType(walked.ty)) {
+        const size = typeBytes(walked.ty) orelse return error.UnsupportedInstruction;
+        const dst_slot = try aggSlotName(allocator, lhs);
+        defer allocator.free(dst_slot);
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ dst_slot, size });
+        if (std.mem.startsWith(u8, source, "%") or std.mem.startsWith(u8, source, "@")) {
+            const src_base = if (std.mem.startsWith(u8, source, "%")) try aggSlotName(allocator, source) else try saValue(allocator, source);
+            defer allocator.free(src_base);
+            const sptr = try ptrAt(out, allocator, ctx, src_base, walked.offset);
+            defer allocator.free(sptr);
+            try emitAggCopyAt(out, allocator, ctx, dst_slot, sptr, walked.ty);
+        } else if (std.mem.eql(u8, source, "zeroinitializer")) {
+            try emitAggZeroAt(out, allocator, ctx, dst_slot, walked.ty);
+        } else if (std.mem.eql(u8, source, "undef")) {
+            // poison: leave the fresh slot unwritten
+        } else {
+            const sub = try walkConstText(allocator, source, parsed.ty, indices);
+            defer allocator.free(sub);
+            try emitAggConstInitAt(out, allocator, ctx, dst_slot, sub, walked.ty);
+        }
+        return;
+    }
+
+    // leaf result
+    const sa_ty = typeTokenToSa(walked.ty) orelse return error.UnsupportedInstruction;
+    const dst = try sanitizeIdent(allocator, lhs, "r");
+    defer allocator.free(dst);
+    if (std.mem.startsWith(u8, source, "%") or std.mem.startsWith(u8, source, "@")) {
+        const src_base = if (std.mem.startsWith(u8, source, "%")) try aggSlotName(allocator, source) else try saValue(allocator, source);
+        defer allocator.free(src_base);
+        const sptr = try ptrAt(out, allocator, ctx, src_base, walked.offset);
+        defer allocator.free(sptr);
+        try listPrint(out, "  {s} = load {s}+0 as {s}\n", .{ dst, sptr, sa_ty });
+        return;
+    }
+    if (std.mem.eql(u8, source, "zeroinitializer") or std.mem.eql(u8, source, "undef")) {
+        try listPrint(out, "  {s} = add 0, 0\n", .{dst});
+        return;
+    }
+    // constant aggregate source: walk the constant text to the leaf
+    const leaf_const = try walkConstText(allocator, source, parsed.ty, indices);
+    defer allocator.free(leaf_const);
+    const value = try saValue(allocator, leaf_const);
+    defer allocator.free(value);
+    try listPrint(out, "  {s} = add {s}, 0\n", .{ dst, value });
+}
+
+/// Walk a constant aggregate's text along a constant index path;
+/// returns the sub-constant text at the path (a fresh copy).
+fn walkConstText(allocator: std.mem.Allocator, source: []const u8, agg_ty: []const u8, indices: []const u64) ![]u8 {
+    var cur_const = try allocator.dupe(u8, stripAggConstTypePrefix(source));
+    errdefer allocator.free(cur_const);
+    var cur_ty = agg_ty;
+    for (indices) |idx| {
+        const body = stripAggConstTypePrefix(cur_const);
+        if (body.len < 2 or (body[0] != '{' and body[0] != '[')) return error.UnsupportedInstruction;
+        const close = findMatching(body, 0, body[0], if (body[0] == '{') '}' else ']') orelse return error.UnsupportedInstruction;
+        const field_texts = try splitTopLevelComma(allocator, trim(body[1..close]));
+        defer allocator.free(field_texts);
+        if (idx >= field_texts.len) return error.UnsupportedInstruction;
+        const next = try allocator.dupe(u8, trim(field_texts[@intCast(idx)]));
+        allocator.free(cur_const);
+        cur_const = next;
+        if (cur_ty[0] == '{') {
+            var layout = (try aggLayout(allocator, cur_ty)) orelse return error.UnsupportedInstruction;
+            defer layout.fields.deinit();
+            cur_ty = layout.fields.items[@intCast(idx)].ty;
+        } else {
+            const arr_body = trim(cur_ty[1 .. cur_ty.len - 1]);
+            const x_idx = std.mem.indexOf(u8, arr_body, " x ") orelse return error.UnsupportedInstruction;
+            cur_ty = trim(arr_body[x_idx + 3 ..]);
+        }
+    }
+    return cur_const;
+}
+
+fn appendInsertValue(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rest: []const u8, ctx: *FnCtx) !void {
+    const parsed = parseTypeText(rest) orelse return error.UnsupportedInstruction;
+    if (!isAggType(parsed.ty)) return error.UnsupportedInstruction;
+    const parts = try splitTopLevelComma(allocator, parsed.rest);
+    defer allocator.free(parts);
+    if (parts.len < 3) return error.UnsupportedInstruction;
+    const indices = try parseIndexList(allocator, parts[2..]);
+    defer allocator.free(indices);
+    const walked = (try walkAggPath(allocator, parsed.ty, indices)) orelse return error.UnsupportedInstruction;
+
+    const size = typeBytes(parsed.ty) orelse return error.UnsupportedInstruction;
+    const dst_slot = try aggSlotName(allocator, lhs);
+    defer allocator.free(dst_slot);
+    try listPrint(out, "  {s} = stack_alloc {d}\n", .{ dst_slot, size });
+    try emitAggValueTo(out, allocator, ctx, dst_slot, trim(parts[0]), parsed.ty);
+
+    const elem_parsed = parseTypeText(parts[1]) orelse return error.UnsupportedInstruction;
+    const dptr = try ptrAt(out, allocator, ctx, dst_slot, walked.offset);
+    defer allocator.free(dptr);
+    if (isAggType(walked.ty)) {
+        try emitAggValueTo(out, allocator, ctx, dptr, elem_parsed.rest, walked.ty);
+    } else {
+        const sa_ty = typeTokenToSa(walked.ty) orelse return error.UnsupportedInstruction;
+        const value = try saValue(allocator, parts[1]);
+        defer allocator.free(value);
+        try listPrint(out, "  store {s}+0, {s} as {s}\n", .{ dptr, value, sa_ty });
+    }
+}
 
 fn defLhsName(line: []const u8) ?[]const u8 {
     const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
@@ -1136,6 +1652,19 @@ fn resultTypeOfDef(allocator: std.mem.Allocator, line: []const u8) !?[]const u8 
         return last;
     }
     if (std.mem.eql(u8, op, "extractvalue")) {
+        const parsed = parseTypeText(rest) orelse return null;
+        const parts = try splitTopLevelComma(allocator, parsed.rest);
+        defer allocator.free(parts);
+        if (parts.len < 2) return null;
+        const indices = try allocator.alloc(u64, parts.len - 1);
+        defer allocator.free(indices);
+        for (parts[1..], 0..) |text, i| {
+            indices[i] = std.fmt.parseInt(u64, trim(text), 10) catch return null;
+        }
+        const walked = (try walkAggPath(allocator, parsed.ty, indices)) orelse return null;
+        return walked.ty;
+    }
+    if (std.mem.eql(u8, op, "insertvalue")) {
         const parsed = parseTypeText(rest) orelse return null;
         return parsed.ty;
     }
@@ -1240,6 +1769,16 @@ fn appendCrossBlockSlots(out: *std.array_list.Managed(u8), ctx: *FnCtx) !void {
     }
 }
 
+/// Copy each aggregate parameter's incoming memory (the parameter
+/// register holds its address) into the parameter's own agg slot.
+fn appendAggParamPrologue(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, ctx: *FnCtx) !void {
+    for (ctx.agg_params[0..ctx.agg_param_count]) |param| {
+        const size = typeBytes(param.ty) orelse return error.UnsupportedInstruction;
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ param.slot, size });
+        try emitAggCopyAt(out, allocator, ctx, param.slot, param.reg, param.ty);
+    }
+}
+
 fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, header: []const u8, body: []const []const u8) !void {
     try appendFunctionHeader(out, allocator, header, false);
 
@@ -1250,6 +1789,33 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
     var ctx = FnCtx{ .allocator = allocator };
     defer ctx.deinit();
     try analyzeCrossBlockValues(&ctx, body);
+
+    // Aggregate return type (sret header was already emitted by
+    // appendFunctionHeader) and aggregate parameters: each agg param
+    // arrives as a pointer to caller memory; the prologue copies it
+    // into the parameter's own agg slot, from which body code reads.
+    if (std.mem.indexOfScalar(u8, header, '@')) |at_idx| {
+        ctx.agg_ret_ty = aggRetFromPrefix(trim(header["define".len..at_idx]));
+        const open = std.mem.indexOfScalar(u8, header, '(') orelse return error.InvalidIr;
+        const close = findMatching(header, open, '(', ')') orelse return error.InvalidIr;
+        const params = try splitTopLevelComma(allocator, header[open + 1 .. close]);
+        defer allocator.free(params);
+        for (params, 0..) |param_text, pidx| {
+            const parsed = parseTypeText(param_text) orelse continue;
+            if (!isAggType(parsed.ty)) continue;
+            if (ctx.agg_param_count >= ctx.agg_params.len) return error.UnsupportedInstruction;
+            var name_token: ?[]const u8 = null;
+            var tokens = std.mem.tokenizeAny(u8, parsed.rest, " \t\r\n");
+            while (tokens.next()) |token| {
+                if (std.mem.startsWith(u8, token, "%")) name_token = token;
+            }
+            const reg = if (name_token) |token| try sanitizeIdent(allocator, token, "arg") else try std.fmt.allocPrint(allocator, "arg{d}", .{pidx});
+            defer allocator.free(reg);
+            const slot = try aggSlotName(allocator, name_token orelse reg);
+            ctx.agg_params[ctx.agg_param_count] = .{ .reg = try allocator.dupe(u8, reg), .ty = parsed.ty, .slot = slot };
+            ctx.agg_param_count += 1;
+        }
+    }
 
     var switch_text = std.array_list.Managed(u8).init(allocator);
     defer switch_text.deinit();
@@ -1267,7 +1833,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             try switch_text.append('\n');
             if (std.mem.indexOfScalar(u8, line, ']') != null) {
                 try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
-                try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+                try appendPhiStoresForBlock(out, allocator, &ctx, phi_lines.items, current_block);
                 try appendSwitch(out, allocator, switch_text.items, switch_id);
                 switch_id += 1;
                 switch_text.clearRetainingCapacity();
@@ -1284,6 +1850,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             if (!phi_slots_emitted) {
                 try appendPhiSlots(out, allocator, phi_lines.items);
                 try appendCrossBlockSlots(out, &ctx);
+                try appendAggParamPrologue(out, allocator, &ctx);
                 phi_slots_emitted = true;
             }
             continue;
@@ -1292,6 +1859,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             try out.appendSlice("L_ENTRY:\n");
             try appendPhiSlots(out, allocator, phi_lines.items);
             try appendCrossBlockSlots(out, &ctx);
+            try appendAggParamPrologue(out, allocator, &ctx);
             phi_slots_emitted = true;
             need_entry_label = false;
         }
@@ -1302,7 +1870,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
             try switch_text.append('\n');
             if (std.mem.indexOfScalar(u8, line, ']') != null) {
                 try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
-                try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+                try appendPhiStoresForBlock(out, allocator, &ctx, phi_lines.items, current_block);
                 try appendSwitch(out, allocator, switch_text.items, switch_id);
                 switch_id += 1;
                 switch_text.clearRetainingCapacity();
@@ -1314,7 +1882,7 @@ fn appendFunctionBody(out: *std.array_list.Managed(u8), allocator: std.mem.Alloc
         if (startsWithWord(line, "br") or startsWithWord(line, "ret")) {
             try ctx.emitReloadsForPhiIncoming(out, phi_lines.items);
             try ctx.emitReloadsForLine(out, line, false);
-            try appendPhiStoresForBlock(out, allocator, phi_lines.items, current_block);
+            try appendPhiStoresForBlock(out, allocator, &ctx, phi_lines.items, current_block);
         } else if (!isPhiInstruction(line)) {
             try ctx.emitReloadsForLine(out, line, true);
         }
@@ -1381,7 +1949,25 @@ fn appendGetElementPtr(out: *std.array_list.Managed(u8), allocator: std.mem.Allo
     try listPrint(out, "  {s} = ptr_add {s}, {s}\n", .{ dst, base, offset });
 }
 
-fn appendCall(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: ?[]const u8, rest: []const u8) !void {
+fn appendCallArg(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    // An aggregate-typed argument is passed as the address of its slot.
+    if (parseTypeText(arg)) |parsed| {
+        if (isAggType(parsed.ty)) {
+            const value = trim(parsed.rest);
+            if (!std.mem.startsWith(u8, value, "%")) return error.UnsupportedInstruction;
+            // attribute words may precede the value; the value is the
+            // last whitespace-separated token
+            const name = llvmTypedValueToValue(value);
+            const slot = try aggSlotName(allocator, name);
+            defer allocator.free(slot);
+            try out.appendSlice(slot);
+            return;
+        }
+    }
+    try appendValue(out, allocator, arg);
+}
+
+fn appendCall(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: ?[]const u8, rest: []const u8, ctx: *FnCtx) !void {
     const call_idx = std.mem.indexOf(u8, rest, "call ") orelse return error.UnsupportedInstruction;
     const call_text = trim(rest[call_idx + "call ".len ..]);
     const at = std.mem.indexOfScalar(u8, call_text, '@') orelse return error.UnsupportedInstruction;
@@ -1392,6 +1978,25 @@ fn appendCall(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
     const callee = try sanitizeIdent(allocator, raw_callee, "fn_");
     defer allocator.free(callee);
 
+    const args = try splitTopLevelComma(allocator, call_text[open + 1 .. close]);
+    defer allocator.free(args);
+
+    // Aggregate return: the caller allocates the result slot and passes
+    // its address as the hidden first (sret) argument.
+    if (aggRetFromPrefix(trim(call_text[0..at]))) |agg_ty| {
+        const size = typeBytes(agg_ty) orelse return error.UnsupportedInstruction;
+        const slot = if (lhs) |lhs_text| try aggSlotName(allocator, lhs_text) else try ctx.freshTmp();
+        defer allocator.free(slot);
+        try listPrint(out, "  {s} = stack_alloc {d}\n", .{ slot, size });
+        try listPrint(out, "  call @{s}({s}", .{ callee, slot });
+        for (args) |arg| {
+            try out.appendSlice(", ");
+            try appendCallArg(out, allocator, arg);
+        }
+        try out.appendSlice(")\n");
+        return;
+    }
+
     if (lhs) |lhs_text| {
         const dst = try sanitizeIdent(allocator, lhs_text, "r");
         defer allocator.free(dst);
@@ -1400,17 +2005,14 @@ fn appendCall(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
         try listPrint(out, "  call @{s}(", .{callee});
     }
 
-    const args = try splitTopLevelComma(allocator, call_text[open + 1 .. close]);
-    defer allocator.free(args);
     for (args, 0..) |arg, idx| {
         if (idx != 0) try out.appendSlice(", ");
-        try appendValue(out, allocator, arg);
+        try appendCallArg(out, allocator, arg);
     }
     try out.appendSlice(")\n");
 }
 
 fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8, ctx: *FnCtx) !void {
-    _ = ctx;
     var words = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
     const op = words.next() orelse return error.InvalidIr;
     const rest_start = std.mem.indexOf(u8, rhs, op) orelse return error.InvalidIr;
@@ -1422,11 +2024,13 @@ fn appendAssignmentInstruction(out: *std.array_list.Managed(u8), allocator: std.
     if (std.mem.eql(u8, op, "icmp")) return appendIcmp(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "fcmp")) return appendFcmp(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "alloca")) return appendAlloca(out, allocator, lhs, rest);
-    if (std.mem.eql(u8, op, "load")) return appendLoad(out, allocator, lhs, rest);
+    if (std.mem.eql(u8, op, "load")) return appendLoad(out, allocator, lhs, rest, ctx);
     if (std.mem.eql(u8, op, "getelementptr")) return appendGetElementPtr(out, allocator, lhs, rest);
     if (std.mem.eql(u8, op, "select")) return appendSelect(out, allocator, lhs, rest);
-    if (std.mem.eql(u8, op, "call") or std.mem.indexOf(u8, rhs, " call ") != null) return appendCall(out, allocator, lhs, rhs);
-    if (std.mem.eql(u8, op, "trunc") or std.mem.eql(u8, op, "zext") or std.mem.eql(u8, op, "sext") or std.mem.eql(u8, op, "bitcast")) {
+    if (std.mem.eql(u8, op, "extractvalue")) return appendExtractValue(out, allocator, lhs, rest, ctx);
+    if (std.mem.eql(u8, op, "insertvalue")) return appendInsertValue(out, allocator, lhs, rest, ctx);
+    if (std.mem.eql(u8, op, "call") or std.mem.indexOf(u8, rhs, " call ") != null) return appendCall(out, allocator, lhs, rhs, ctx);
+    if (std.mem.eql(u8, op, "trunc") or std.mem.eql(u8, op, "zext") or std.mem.eql(u8, op, "sext") or std.mem.eql(u8, op, "bitcast") or std.mem.eql(u8, op, "inttoptr") or std.mem.eql(u8, op, "ptrtoint") or std.mem.eql(u8, op, "addrspacecast")) {
         return appendCast(out, allocator, lhs, op, rest);
     }
 
@@ -1444,10 +2048,16 @@ fn appendInstruction(out: *std.array_list.Managed(u8), allocator: std.mem.Alloca
         return appendAssignmentInstruction(out, allocator, lhs, rhs, ctx);
     }
 
-    if (startsWithWord(t, "ret")) return appendReturn(out, allocator, t["ret".len..]);
+    if (startsWithWord(t, "ret")) return appendReturn(out, allocator, t["ret".len..], ctx);
     if (startsWithWord(t, "br")) return appendBranch(out, allocator, t["br".len..]);
-    if (startsWithWord(t, "store")) return appendStore(out, allocator, t["store".len..]);
-    if (std.mem.indexOf(u8, t, "call ") != null) return appendCall(out, allocator, null, t);
+    if (startsWithWord(t, "store")) return appendStore(out, allocator, t["store".len..], ctx);
+    // LLVM `unreachable` is a trap by definition; SA's panic code 102
+    // is the sa_std UNREACHABLE code (panic.sa).
+    if (std.mem.eql(u8, t, "unreachable")) {
+        try out.appendSlice("  panic(102)\n");
+        return;
+    }
+    if (std.mem.indexOf(u8, t, "call ") != null) return appendCall(out, allocator, null, t, ctx);
 
     return error.UnsupportedInstruction;
 }
@@ -2155,6 +2765,141 @@ test "bc2sa zext lowers to a source-width mask" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "w = and b, 255"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, out, 1, "zext"));
+}
+
+test "bc2sa inttoptr constant expression and instruction form" {
+    // probe min_itp.ll: dangling-pointer constant expression in a store
+    const ir =
+        \\define void @itp(ptr %p) {
+        \\entry:
+        \\  store ptr inttoptr (i64 8 to ptr), ptr %p, align 8
+        \\  %q = inttoptr i64 16 to ptr
+        \\  store i64 1, ptr %q, align 8
+        \\  ret void
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store p+0, 8 as ptr"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "q = bitcast 16 as ptr"));
+}
+
+test "bc2sa extractvalue over an aggregate call result (sret)" {
+    // probe min_ev.ll
+    const ir =
+        \\declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)
+        \\define i64 @ev(i64 %a, i64 %b) {
+        \\entry:
+        \\  %r = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 %a, i64 %b)
+        \\  %v = extractvalue { i64, i1 } %r, 0
+        \\  %w = extractvalue { i64, i1 } %r, 1
+        \\  %x = zext i1 %w to i64
+        \\  %y = add i64 %v, %x
+        \\  ret i64 %y
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "@extern llvm_ssub_with_overflow_i64(bc2sa_sret: ptr, arg0: i64, arg1: i64)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_agg_r = stack_alloc 16"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "call @llvm_ssub_with_overflow_i64(bc2sa_agg_r, a, b)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "v = load bc2sa_agg_r+0 as i64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_t1 = ptr_add bc2sa_agg_r, 8"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "w = load bc2sa_t1+0 as i1"));
+}
+
+test "bc2sa insertvalue and aggregate return (sret out)" {
+    // probe min_iv.ll
+    const ir =
+        \\define { i64, i1 } @iv(i64 %a) {
+        \\entry:
+        \\  %r = insertvalue { i64, i1 } undef, i64 %a, 0
+        \\  ret { i64, i1 } %r
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "@export iv(bc2sa_sret: ptr, a: i64):"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_agg_r = stack_alloc 16"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_agg_r+0, a as i64"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_sret+0"));
+}
+
+test "bc2sa unreachable lowers to panic(102)" {
+    // probe min_un.ll; 102 is sa_std's UNREACHABLE panic code
+    const ir =
+        \\define i64 @un(i64 %a) {
+        \\entry:
+        \\  %c = icmp eq i64 %a, 0
+        \\  br i1 %c, label %ok, label %bad
+        \\ok:
+        \\  ret i64 %a
+        \\bad:
+        \\  unreachable
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "panic(102)"));
+}
+
+test "bc2sa extractvalue from a constant aggregate and aggregate alloca" {
+    // probe min_ev2.ll
+    const ir =
+        \\define i64 @evonly(i64 %a) {
+        \\entry:
+        \\  %p = alloca { i64, i1 }, align 8
+        \\  %v = extractvalue { i64, i1 } { i64 5, i1 true }, 0
+        \\  ret i64 %v
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "p = stack_alloc 16"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "v = add 5, 0"));
+}
+
+test "bc2sa phi with undef incoming stores zero" {
+    const ir =
+        \\define i64 @pu(i64 %a) {
+        \\entry:
+        \\  br label %head
+        \\head:
+        \\  %i = phi i64 [ undef, %entry ], [ %n, %head ]
+        \\  %n = add i64 %i, 1
+        \\  %c = icmp slt i64 %n, %a
+        \\  br i1 %c, label %head, label %exit
+        \\exit:
+        \\  ret i64 %n
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_phi_slot_i+0, 0 as i64"));
+}
+
+test "bc2sa aggregate load and store round-trip through memory" {
+    const ir =
+        \\define { i64, i1 } @ldst(ptr %p) {
+        \\entry:
+        \\  %v = load { i64, i1 }, ptr %p, align 8
+        \\  %q = alloca { i64, i1 }, align 8
+        \\  store { i64, i1 } %v, ptr %q, align 8
+        \\  ret { i64, i1 } %v
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "bc2sa_agg_v = stack_alloc 16"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store q+0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "ptr_add q, 8"));
 }
 
 test "bc2sa normalization rewrites the four dialect-drift classes" {
