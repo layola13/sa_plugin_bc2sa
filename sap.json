@@ -30,6 +30,34 @@
       "spawn": true,
       "exec": [
         {
+          "path": "/usr/bin/llvm-dis-23",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/lib/llvm-23/bin/llvm-dis",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-22",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-21",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-20",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-19",
+          "args": ["-o", "-", "*"]
+        },
+        {
+          "path": "/usr/bin/llvm-dis-18",
+          "args": ["-o", "-", "*"]
+        },
+        {
           "path": "/usr/bin/llvm-dis-17",
           "args": ["-o", "-", "*"]
         },
@@ -47,6 +75,14 @@
         },
         {
           "path": "/usr/bin/clang",
+          "args": ["-S", "-emit-llvm", "*", "-o", "-"]
+        },
+        {
+          "path": "/usr/bin/clang-23",
+          "args": ["-S", "-emit-llvm", "*", "-o", "-"]
+        },
+        {
+          "path": "/usr/lib/llvm-23/bin/clang",
           "args": ["-S", "-emit-llvm", "*", "-o", "-"]
         }
       ]

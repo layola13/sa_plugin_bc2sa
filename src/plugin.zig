@@ -91,6 +91,15 @@ fn runLlvm2SaCommand(ctx: *const plugin_api.Context, argv: []const []const u8, s
 }
 
 fn writeTranslateError(writer: *std.Io.Writer, err: anyerror) !void {
+    if (err == error.LlvmDisFailed or err == error.LlvmDisNotFound) {
+        try writer.print("error: {s}\n", .{@errorName(err)});
+        // The translator records why every disassembler candidate failed
+        // (e.g. llvm-dis too old for the bitcode summary version); surface
+        // the whole chain so the failure is actionable, not a bare name.
+        const report = bc2sa.lastDisassemblyFailure();
+        if (report.len > 0) try writer.writeAll(report);
+        return;
+    }
     const detail = switch (err) {
         error.StaticMemoryOverflow => .{
             .code = "SA-CLI-019",

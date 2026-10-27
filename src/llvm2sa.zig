@@ -17,10 +17,14 @@ const max_bitcode_bytes = 64 * 1024 * 1024;
 const max_ir_bytes = 64 * 1024 * 1024;
 // NOTE: multi-version candidates, newest first. Must stay a subset of the
 // absolute paths whitelisted in `sap.json` process.exec: the plugin sandbox
-// denies spawning anything not on that list.
-const llvm_dis_candidates = [_][]const u8{ "/usr/bin/llvm-dis-17", "/usr/bin/llvm-dis-16", "/usr/bin/llvm-dis-15", "/usr/bin/llvm-dis-14" };
-const clang_candidates = [_][]const u8{"/usr/bin/clang"};
-const llvm_as_candidates = [_][]const u8{ "/usr/bin/llvm-as-17", "/usr/bin/llvm-as-16", "/usr/bin/llvm-as-15", "/usr/bin/llvm-as-14" };
+// denies spawning anything not on that list. LLVM 23 is required to read
+// bitcode emitted by rustc 1.99 (LLVM 23.1.1, bitcode summary version 14);
+// older llvm-dis releases reject it as an unknown summary version. On the
+// Colab box `/usr/bin/llvm-dis-23` is a symlink to the rustup llvm-tools
+// component binary (LLVM 23.1.1-rust-1.99.1-stable).
+const llvm_dis_candidates = [_][]const u8{ "/usr/bin/llvm-dis-23", "/usr/lib/llvm-23/bin/llvm-dis", "/usr/bin/llvm-dis-22", "/usr/bin/llvm-dis-21", "/usr/bin/llvm-dis-20", "/usr/bin/llvm-dis-19", "/usr/bin/llvm-dis-18", "/usr/bin/llvm-dis-17", "/usr/bin/llvm-dis-16", "/usr/bin/llvm-dis-15", "/usr/bin/llvm-dis-14" };
+const clang_candidates = [_][]const u8{ "/usr/bin/clang", "/usr/bin/clang-23", "/usr/lib/llvm-23/bin/clang" };
+const llvm_as_candidates = [_][]const u8{ "/usr/bin/llvm-as-23", "/usr/bin/llvm-as-20", "/usr/bin/llvm-as-17", "/usr/bin/llvm-as-16", "/usr/bin/llvm-as-15", "/usr/bin/llvm-as-14" };
 
 /// NOTE(Zig 0.17): ambient filesystem/subprocess access was removed; every
 /// fs/process op needs an explicit `Io`. Lazily created once per process.
@@ -1211,58 +1215,115 @@ pub fn translateIrSource(allocator: std.mem.Allocator, source: []const u8) ![]u8
     return try out.toOwnedSlice();
 }
 
-fn runLlvmDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u8) !?[]u8 {
-    const argv = [_][]const u8{ exe, "-o", "-", path };
+/// One disassembly attempt. A candidate that exists but rejects the input
+/// (e.g. an older llvm-dis facing a newer bitcode summary version) must NOT
+/// short-circuit the chain: the failure reason is recorded and the next
+/// candidate is tried. Only when every candidate has failed is an error
+/// returned, with all reasons preserved in `lastDisassemblyFailure`.
+const DisAttempt = union(enum) {
+    ok: []u8,
+    not_found,
+    failed: []u8,
+};
+
+var dis_failure_buf: [8192]u8 = undefined;
+var dis_failure_len: usize = 0;
+
+/// Per-candidate failure report from the most recent `disassembleBitcode`
+/// call that exhausted the whole chain (empty when the last call succeeded
+/// or never ran). One line per candidate: `<path>: <reason>`.
+pub fn lastDisassemblyFailure() []const u8 {
+    return dis_failure_buf[0..dis_failure_len];
+}
+
+fn setDisassemblyFailure(report: []const u8) void {
+    const n = @min(report.len, dis_failure_buf.len);
+    @memcpy(dis_failure_buf[0..n], report[0..n]);
+    dis_failure_len = n;
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const t = trim(text);
+    const nl = std.mem.indexOfScalar(u8, t, '\n') orelse return t;
+    return trim(t[0..nl]);
+}
+
+fn runDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u8, use_clang: bool) !DisAttempt {
+    const dis_argv = [_][]const u8{ exe, "-o", "-", path };
+    const clang_argv = [_][]const u8{ exe, "-S", "-emit-llvm", path, "-o", "-" };
+    const argv: []const []const u8 = if (use_clang) &clang_argv else &dis_argv;
     const result = std.process.run(allocator, io(), .{
-        .argv = argv[0..],
+        .argv = argv,
         .stdout_limit = .limited(max_ir_bytes),
         .stderr_limit = .limited(max_ir_bytes),
     }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
+        error.FileNotFound => return .not_found,
+        else => return .{ .failed = try std.fmt.allocPrint(allocator, "spawn failed: {s}", .{@errorName(err)}) },
     };
-    errdefer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| {
-            if (code == 0) return result.stdout;
-            return error.LlvmDisFailed;
+            if (code == 0) {
+                if (result.stdout.len == 0) {
+                    allocator.free(result.stdout);
+                    return .{ .failed = try allocator.dupe(u8, "exit 0 but produced no output") };
+                }
+                return .{ .ok = result.stdout };
+            }
+            allocator.free(result.stdout);
+            const why = firstLine(result.stderr);
+            return .{ .failed = if (why.len > 0)
+                try std.fmt.allocPrint(allocator, "exit {d}: {s}", .{ code, why })
+            else
+                try std.fmt.allocPrint(allocator, "exit {d}", .{code}) };
         },
-        else => return error.LlvmDisFailed,
+        else => {
+            allocator.free(result.stdout);
+            return .{ .failed = try allocator.dupe(u8, "terminated abnormally") };
+        },
     }
 }
 
-fn runClangDisTool(allocator: std.mem.Allocator, exe: []const u8, path: []const u8) !?[]u8 {
-    const argv = [_][]const u8{ exe, "-S", "-emit-llvm", path, "-o", "-" };
-    const result = std.process.run(allocator, io(), .{
-        .argv = argv[0..],
-        .stdout_limit = .limited(max_ir_bytes),
-        .stderr_limit = .limited(max_ir_bytes),
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    errdefer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+fn disassembleWithCandidates(allocator: std.mem.Allocator, path: []const u8, dis_candidates: []const []const u8, clang_cands: []const []const u8) ![]u8 {
+    var report = std.array_list.Managed(u8).init(allocator);
+    defer report.deinit();
+    var any_ran = false;
 
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) return result.stdout;
-            return error.LlvmDisFailed;
-        },
-        else => return error.LlvmDisFailed,
+    for (dis_candidates) |candidate| {
+        switch (try runDisTool(allocator, candidate, path, false)) {
+            .ok => |ir| {
+                setDisassemblyFailure("");
+                return ir;
+            },
+            .not_found => try listPrint(&report, "{s}: not found\n", .{candidate}),
+            .failed => |reason| {
+                any_ran = true;
+                defer allocator.free(reason);
+                try listPrint(&report, "{s}: {s}\n", .{ candidate, reason });
+            },
+        }
     }
+    for (clang_cands) |candidate| {
+        switch (try runDisTool(allocator, candidate, path, true)) {
+            .ok => |ir| {
+                setDisassemblyFailure("");
+                return ir;
+            },
+            .not_found => try listPrint(&report, "{s}: not found\n", .{candidate}),
+            .failed => |reason| {
+                any_ran = true;
+                defer allocator.free(reason);
+                try listPrint(&report, "{s}: {s}\n", .{ candidate, reason });
+            },
+        }
+    }
+    setDisassemblyFailure(report.items);
+    return if (any_ran) error.LlvmDisFailed else error.LlvmDisNotFound;
 }
 
 fn disassembleBitcode(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    for (llvm_dis_candidates) |candidate| {
-        if (try runLlvmDisTool(allocator, candidate, path)) |ir| return ir;
-    }
-    for (clang_candidates) |candidate| {
-        if (try runClangDisTool(allocator, candidate, path)) |ir| return ir;
-    }
-    return error.LlvmDisNotFound;
+    return disassembleWithCandidates(allocator, path, llvm_dis_candidates[0..], clang_candidates[0..]);
 }
 
 pub fn translateBitcodeFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1497,4 +1558,62 @@ test "bc2sa lowers scalar phi through a stack slot" {
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_phi_slot_i+0, 0 as i32"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "store bc2sa_phi_slot_i+0, next as i32"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "i = load bc2sa_phi_slot_i+0 as i32"));
+}
+
+test "bc2sa disassembly falls back past a failing candidate" {
+    // Pre-fix behaviour: the first existing candidate that exited nonzero
+    // aborted the whole chain with error.LlvmDisFailed, so a too-old
+    // llvm-dis permanently blocked newer ones behind it (and clang).
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io(), .{ .sub_path = "sample.ll", .data =
+        \\define i32 @main(i32 %lhs, i32 %rhs) {
+        \\entry:
+        \\  %0 = add i32 %lhs, %rhs
+        \\  ret i32 %0
+        \\}
+        \\
+    });
+    const ll_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sample.ll" });
+    defer std.testing.allocator.free(ll_path);
+    const tmp_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(tmp_path);
+    const bc_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "sample.bc" });
+    defer std.testing.allocator.free(bc_path);
+    try llvmAs(std.testing.allocator, ll_path, bc_path);
+
+    // /bin/false always exits 1: the chain must record it and move on to
+    // the real llvm-dis-23 instead of short-circuiting. (llvm-as-23 emits
+    // LLVM 23 bitcode, which is exactly what older candidates reject.)
+    const ir = try disassembleWithCandidates(std.testing.allocator, bc_path, &.{ "/bin/false", "/usr/bin/llvm-dis-23" }, &.{});
+    defer std.testing.allocator.free(ir);
+    try std.testing.expect(std.mem.containsAtLeast(u8, ir, 1, "define i32 @main"));
+    try std.testing.expectEqual(@as(usize, 0), lastDisassemblyFailure().len);
+}
+
+test "bc2sa disassembly report lists every candidate failure" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io(), .{ .sub_path = "junk.bc", .data = "BC\xc0\xde not really bitcode" });
+    const bc_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "junk.bc" });
+    defer std.testing.allocator.free(bc_path);
+
+    // /bin/false exits 1 silently; /bin/true exits 0 with no output: both
+    // are failures, both must appear in the report, and the error must be
+    // LlvmDisFailed (candidates ran) rather than a bare short-circuit.
+    try std.testing.expectError(error.LlvmDisFailed, disassembleWithCandidates(std.testing.allocator, bc_path, &.{ "/bin/false", "/bin/true" }, &.{}));
+    const report = lastDisassemblyFailure();
+    try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/false: exit 1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, report, 1, "/bin/true: exit 0 but produced no output"));
+}
+
+test "bc2sa disassembly distinguishes no candidate installed" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io(), .{ .sub_path = "junk.bc", .data = "BC\xc0\xde not really bitcode" });
+    const bc_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "junk.bc" });
+    defer std.testing.allocator.free(bc_path);
+
+    try std.testing.expectError(error.LlvmDisNotFound, disassembleWithCandidates(std.testing.allocator, bc_path, &.{"/nonexistent/llvm-dis-99"}, &.{}));
+    try std.testing.expect(std.mem.containsAtLeast(u8, lastDisassemblyFailure(), 1, "/nonexistent/llvm-dis-99: not found"));
 }
