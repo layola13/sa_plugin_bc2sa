@@ -1,0 +1,16 @@
+// Probe harness (Agent AM): tier_c fnv1a_fixed only (fnv1a_stream is
+// referee-blocked; see REPORT.md). Compares against the native truth binary.
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "tier_c_fixed.sai"
+@import "tier_c_fixed.sa"
+@import "stub_c.sa"
+
+fn main() -> i32 {
+    let a = fnv1a_fixed();
+    println("fnv1a_fixed() = {}", a);
+    if a != 3500526725341250453 {
+        return 1;
+    };
+    return 0;
+}

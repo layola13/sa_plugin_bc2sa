@@ -1,0 +1,2 @@
+@extern fnv1a_fixed() -> u64
+@extern fnv1a_stream(n: i32) -> u64

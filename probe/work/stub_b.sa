@@ -1,0 +1,6 @@
+// Probe stub (Agent AM): rustc's no-alloc shim marker, called (but semantically
+// empty) from translated tier_b code. Defined in raw SA with the exact mangled
+// name so the emitted object symbol matches the translated call site.
+@export _RNvCs5fGHjzWXRav_7___rustc35___rust_no_alloc_shim_is_unstable_v2():
+L_entry:
+  return

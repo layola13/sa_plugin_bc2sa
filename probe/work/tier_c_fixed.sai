@@ -1,0 +1,1 @@
+@extern fnv1a_fixed() -> u64

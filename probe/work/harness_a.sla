@@ -1,0 +1,33 @@
+// Probe harness (Agent AM): calls the bc2sa-translated tier_a functions and
+// compares against the native rustc binary's printed truth values.
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "tier_a.sai"
+@import "tier_a.sa"
+
+fn llvm_assume(x: bool) -> void {}
+
+fn feq(a: f64, b: f64) -> bool {
+    let d = a - b;
+    return d < 0.001 && d > -0.001;
+}
+
+fn main() -> i32 {
+    let fails: i32 = 0;
+    if !feq(area_code(0, 2.0, 0.0), 12.566370614359172) { fails = fails + 1; };
+    if !feq(area_code(1, 3.0, 4.0), 12.0) { fails = fails + 1; };
+    if !feq(area_code(7, 3.0, 4.0), -1.0) { fails = fails + 1; };
+    if classify(-100) != -3 { fails = fails + 1; };
+    if classify(-5) != -1 { fails = fails + 1; };
+    if classify(0) != 0 { fails = fails + 1; };
+    if classify(42) != 1 { fails = fails + 1; };
+    if classify(500) != 2 { fails = fails + 1; };
+    if classify(5000) != 3 { fails = fails + 1; };
+    if fib(20) != 6765 { fails = fails + 1; };
+    if dist2(0, 0, 3, 4) != 25 { fails = fails + 1; };
+    if sign_chain(20) != 2 { fails = fails + 1; };
+    if sign_chain(-20) != -2 { fails = fails + 1; };
+    if sign_chain(0) != 0 { fails = fails + 1; };
+    println("tier_a fails={}", fails);
+    return fails;
+}

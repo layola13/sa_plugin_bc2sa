@@ -1,0 +1,7 @@
+@export fnv1a_fixed() -> i64:
+L_start:
+  return 3500526725341250453
+
+@extern llvm_lifetime_start_p0(arg0: ptr)
+@extern llvm_lifetime_end_p0(arg0: ptr)
+@extern llvm_memset_p0_i64(arg0: ptr, arg1: i8, arg2: i64, arg3: i1)

@@ -1,0 +1,22 @@
+// Probe harness (Agent AM): tier_c real-crate (fnv 1.0.7) verification
+// against the natively compiled truth binary.
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "tier_c.sai"
+@import "tier_c_nv.sa"
+@import "stub_c.sa"
+
+fn main() -> i32 {
+    let fails: i32 = 0;
+    let a = fnv1a_fixed();
+    println("fnv1a_fixed() = {}", a);
+    if a != 3500526725341250453 { fails = fails + 1; };
+    let b = fnv1a_stream(100);
+    println("fnv1a_stream(100) = {}", b);
+    if b != 12329050111136824823u64 { fails = fails + 1; };
+    let c = fnv1a_stream(1);
+    println("fnv1a_stream(1) = {}", c);
+    if c != 528294414896585925 { fails = fails + 1; };
+    println("tier_c fails={}", fails);
+    return fails;
+}

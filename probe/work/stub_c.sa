@@ -1,0 +1,30 @@
+// Probe stubs (Agent AM): runtime surface that bc2sa-translated tier_c code
+// expects from the Rust/LLVM environment. Lifetime markers are no-ops;
+// llvm_memset_p0_i64 is a byte loop (slot-carried counter: SA computed
+// registers are block-scoped, stack slots and params are function-scoped).
+@export llvm_lifetime_start_p0(p: ptr):
+L_entry:
+  return
+
+@export llvm_lifetime_end_p0(p: ptr):
+L_entry:
+  return
+
+@export llvm_memset_p0_i64(p: ptr, v: i8, n: i64, vol: i1):
+L_entry:
+  slot = stack_alloc 8
+  store slot+0, 0 as i64
+  jmp L_loop
+L_loop:
+  i = load slot+0 as i64
+  c = ult i, n
+  br c -> L_body, L_done
+L_body:
+  i = load slot+0 as i64
+  q = ptr_add p, i
+  store q+0, v as i8
+  i2 = add i, 1
+  store slot+0, i2 as i64
+  jmp L_loop
+L_done:
+  return

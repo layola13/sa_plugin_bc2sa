@@ -1,0 +1,100 @@
+@export area_code(tag: i32, a: f64, b: f64) -> f64:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 8
+  store bc2sa_phi_slot__0_sroa_0_0+0, -1 as f64
+  bc2sa_switch_cmp_0_0 = eq tag, 0
+  br bc2sa_switch_cmp_0_0 -> L_bb4, L_BC2SA_SWITCH_NEXT_0_0
+L_BC2SA_SWITCH_NEXT_0_0:
+  bc2sa_switch_cmp_0_1 = eq tag, 1
+  br bc2sa_switch_cmp_0_1 -> L_bb3, L_bb1
+L_bb4:
+  _6 = fmul a, 3.141592653589793
+  r0 = fmul a, _6
+  store bc2sa_phi_slot__0_sroa_0_0+0, r0 as f64
+  jmp L_bb1
+L_bb3:
+  r1 = fmul a, b
+  store bc2sa_phi_slot__0_sroa_0_0+0, r1 as f64
+  jmp L_bb1
+L_bb1:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as f64
+  return _0_sroa_0_0
+
+@export classify(n: i32) -> i32:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 4
+  _9 = slt n, -99
+  store bc2sa_phi_slot__0_sroa_0_0+0, -3 as i32
+  br _9 -> L_bb15, L_bb3
+L_bb3:
+  _7 = slt n, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, -1 as i32
+  br _7 -> L_bb15, L_bb5
+L_bb5:
+  r0 = eq n, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 0 as i32
+  br r0 -> L_bb15, L_bb6
+L_bb6:
+  _5 = ult n, 100
+  store bc2sa_phi_slot__0_sroa_0_0+0, 1 as i32
+  br _5 -> L_bb15, L_bb8
+L_bb15:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as i32
+  return _0_sroa_0_0
+L_bb8:
+  _3 = ult n, 1000
+  bc2sa_select_slot_r_ = stack_alloc 4
+  br _3 -> L_BC2SA_SELECT_TRUE_r_, L_BC2SA_SELECT_FALSE_r_
+L_BC2SA_SELECT_TRUE_r_:
+  store bc2sa_select_slot_r_+0, 2 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_FALSE_r_:
+  store bc2sa_select_slot_r_+0, 3 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_JOIN_r_:
+  r_ = load bc2sa_select_slot_r_+0 as i32
+  store bc2sa_phi_slot__0_sroa_0_0+0, r_ as i32
+  jmp L_bb15
+
+@export dist2(x1: i64, y1: i64, x2: i64, y2: i64) -> i64:
+L_start:
+  p = sub x2, x1
+  p1 = sub y2, y1
+  _7 = mul p, p
+  _8 = mul p1, p1
+  _0 = add _8, _7
+  return _0
+
+@export sign_chain(x: i32) -> i32:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 4
+  _2 = sgt x, 10
+  store bc2sa_phi_slot__0_sroa_0_0+0, 2 as i32
+  br _2 -> L_bb12, L_bb2
+L_bb2:
+  _3 = sgt x, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 1 as i32
+  br _3 -> L_bb12, L_bb4
+L_bb4:
+  r0 = eq x, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 0 as i32
+  br r0 -> L_bb12, L_bb6
+L_bb6:
+  _4 = ugt x, -10
+  bc2sa_select_slot_r_ = stack_alloc 4
+  br _4 -> L_BC2SA_SELECT_TRUE_r_, L_BC2SA_SELECT_FALSE_r_
+L_BC2SA_SELECT_TRUE_r_:
+  store bc2sa_select_slot_r_+0, -1 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_FALSE_r_:
+  store bc2sa_select_slot_r_+0, -2 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_JOIN_r_:
+  r_ = load bc2sa_select_slot_r_+0 as i32
+  store bc2sa_phi_slot__0_sroa_0_0+0, r_ as i32
+  jmp L_bb12
+L_bb12:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as i32
+  return _0_sroa_0_0
+
+@extern llvm_assume(arg0: i1)

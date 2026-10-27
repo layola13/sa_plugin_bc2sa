@@ -1,0 +1,16 @@
+// Probe harness (Agent AM): tier_b string_fmt only (the sole tier_b function
+// that survived translation, fully constant-folded by rustc at O2).
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "tier_b_fmt.sai"
+@import "tier_b_fmt.sa"
+@import "stub_b.sa"
+
+fn main() -> i32 {
+    let r = string_fmt();
+    println("string_fmt() = {}", r);
+    if r != 4208 {
+        return 1;
+    };
+    return 0;
+}

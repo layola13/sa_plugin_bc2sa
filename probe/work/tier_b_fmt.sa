@@ -1,0 +1,19 @@
+@const alloc_e342eacdbf38ee6e7c7878ca690b4e0f = utf8:"alpha,beta,,gamma,delta"
+@extern rust_eh_personality(arg0: i32, arg1: i32, arg2: i64, arg3: ptr, arg4: ptr) -> i32
+@extern llvm_lifetime_start_p0(arg0: ptr)
+@extern llvm_assume(arg0: i1)
+@extern llvm_lifetime_end_p0(arg0: ptr)
+@extern _RNvNtCsgFX3jaOk65H_5alloc7raw_vec12handle_error(arg0: i64, arg1: i64)
+@extern _RNvCs5fGHjzWXRav_7___rustc14___rust_dealloc(arg0: ptr, arg1: i64, arg2: i64)
+@extern _RNvCs5fGHjzWXRav_7___rustc14___rust_realloc(arg0: ptr, arg1: i64, arg2: i64, arg3: i64) -> ptr
+@extern _RNvCs5fGHjzWXRav_7___rustc35___rust_no_alloc_shim_is_unstable_v2()
+@extern _RNvCs5fGHjzWXRav_7___rustc12___rust_alloc(arg0: i64, arg1: i64) -> ptr
+@extern llvm_umul_with_overflow_i64(arg0: i64, arg1: i64) -> i1
+@extern _RNvNtNtCskADBYZwJmSU_4core5slice6memchr14memchr_aligned(arg0: i8, arg1: ptr, arg2: i64) -> i64
+@extern bcmp(arg0: ptr, arg1: ptr, arg2: i64) -> i32
+@extern llvm_umax_i64(arg0: i64, arg1: i64) -> i64
+@export string_fmt() -> i64:
+L__RINvMNtCskADBYZwJmSU_4core6optionINtB3_6OptionReE11map_or_elseNtNtCsgFX3jaOk65H_5alloc6string6StringNCNvNtB12_3fmt6format0NvYeNtNtB12_6borrow7ToOwned8to_ownedECsYR6quqRMAk_6tier_b_exit:
+  call @_RNvCs5fGHjzWXRav_7___rustc35___rust_no_alloc_shim_is_unstable_v2()
+  return 4208
+

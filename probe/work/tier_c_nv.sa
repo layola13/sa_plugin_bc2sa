@@ -1,0 +1,96 @@
+@export fnv1a_fixed() -> i64:
+L_start:
+  return 3500526725341250453
+
+@export fnv1a_stream(n: i32) -> i64:
+L_start:
+  bc2sa_phi_slot_i_sroa_0_010 = stack_alloc 4
+  bc2sa_phi_slot_h_sroa_0_09 = stack_alloc 8
+  bc2sa_phi_slot_h_sroa_0_0_lcssa = stack_alloc 8
+  bc2sa_phi_slot_hash_sroa_0_05_i = stack_alloc 8
+  bc2sa_phi_slot_iter_sroa_0_04_i_idx = stack_alloc 8
+  bc2sa_phi_slot_j_sroa_0_07 = stack_alloc 8
+  buf = stack_alloc 64
+  call @llvm_lifetime_start_p0(buf)
+  call @llvm_memset_p0_i64(buf, 0, 64, 0)
+  _58_not = eq n, 0
+  store bc2sa_phi_slot_i_sroa_0_010+0, 0 as i32
+  store bc2sa_phi_slot_h_sroa_0_09+0, -3750763034362895579 as i64
+  store bc2sa_phi_slot_h_sroa_0_0_lcssa+0, -3750763034362895579 as i64
+  br _58_not -> L_bb8, L_bb3_preheader
+L_bb3_preheader:
+  i_sroa_0_010 = load bc2sa_phi_slot_i_sroa_0_010+0 as i32
+  h_sroa_0_09 = load bc2sa_phi_slot_h_sroa_0_09+0 as i64
+  _13 = mul i_sroa_0_010, 31
+  _12 = add _13, 13
+  store bc2sa_phi_slot_j_sroa_0_07+0, 0 as i64
+  jmp L_bb5
+L_bb8:
+  h_sroa_0_0_lcssa = load bc2sa_phi_slot_h_sroa_0_0_lcssa+0 as i64
+  call @llvm_lifetime_end_p0(buf)
+  return h_sroa_0_0_lcssa
+L_bb3_i:
+  hash_sroa_0_05_i = load bc2sa_phi_slot_hash_sroa_0_05_i+0 as i64
+  iter_sroa_0_04_i_idx = load bc2sa_phi_slot_iter_sroa_0_04_i_idx+0 as i64
+  iter_sroa_0_04_i_ptr = ptr_add buf, iter_sroa_0_04_i_idx
+  _9_i = load iter_sroa_0_04_i_ptr+0 as i8
+  _8_i = zext _9_i as i64
+  r0 = xor hash_sroa_0_05_i, _8_i
+  _10_i = mul r0, 1099511628211
+  r1 = ptr_add buf, iter_sroa_0_04_i_idx
+  iter_sroa_0_04_i_ptr_1 = ptr_add r1, 1
+  _9_i_1 = load iter_sroa_0_04_i_ptr_1+0 as i8
+  _8_i_1 = zext _9_i_1 as i64
+  r2 = xor _10_i, _8_i_1
+  _10_i_1 = mul r2, 1099511628211
+  r3 = ptr_add buf, iter_sroa_0_04_i_idx
+  iter_sroa_0_04_i_ptr_2 = ptr_add r3, 2
+  _9_i_2 = load iter_sroa_0_04_i_ptr_2+0 as i8
+  _8_i_2 = zext _9_i_2 as i64
+  r4 = xor _10_i_1, _8_i_2
+  _10_i_2 = mul r4, 1099511628211
+  r5 = ptr_add buf, iter_sroa_0_04_i_idx
+  iter_sroa_0_04_i_ptr_3 = ptr_add r5, 3
+  iter_sroa_0_04_i_add_3 = add iter_sroa_0_04_i_idx, 4
+  _9_i_3 = load iter_sroa_0_04_i_ptr_3+0 as i8
+  _8_i_3 = zext _9_i_3 as i64
+  r6 = xor _10_i_2, _8_i_3
+  _10_i_3 = mul r6, 1099511628211
+  _23_i_3 = eq iter_sroa_0_04_i_add_3, 64
+  store bc2sa_phi_slot_hash_sroa_0_05_i+0, _10_i_3 as i64
+  store bc2sa_phi_slot_iter_sroa_0_04_i_idx+0, iter_sroa_0_04_i_add_3 as i64
+  br _23_i_3 -> L__RNvXs0_NtCsdjFn5GDoF3D_3lib3fnvNtB5_9FnvHasherNtNtCskADBYZwJmSU_4core4hash6Hasher5write_exit, L_bb3_i
+L__RNvXs0_NtCsdjFn5GDoF3D_3lib3fnvNtB5_9FnvHasherNtNtCskADBYZwJmSU_4core4hash6Hasher5write_exit:
+  r7 = add i_sroa_0_010, 1
+  exitcond11_not = eq r7, n
+  store bc2sa_phi_slot_i_sroa_0_010+0, r7 as i32
+  store bc2sa_phi_slot_h_sroa_0_09+0, _10_i_3 as i64
+  store bc2sa_phi_slot_h_sroa_0_0_lcssa+0, _10_i_3 as i64
+  br exitcond11_not -> L_bb8, L_bb3_preheader
+L_bb5:
+  j_sroa_0_07 = load bc2sa_phi_slot_j_sroa_0_07+0 as i64
+  _16 = trunc j_sroa_0_07 as i32
+  _15 = mul _16, 7
+  _11 = add _12, _15
+  _10 = urem _11, 251
+  r8 = ptr_add buf, j_sroa_0_07
+  r9 = trunc _10 as i8
+  store r8+0, r9 as i8
+  r10 = or j_sroa_0_07, 1
+  _16_1 = trunc r10 as i32
+  _15_1 = mul _16_1, 7
+  _11_1 = add _12, _15_1
+  _10_1 = urem _11_1, 251
+  r11 = ptr_add buf, r10
+  r12 = trunc _10_1 as i8
+  store r11+0, r12 as i8
+  r13 = add j_sroa_0_07, 2
+  exitcond_not_1 = eq r13, 64
+  store bc2sa_phi_slot_hash_sroa_0_05_i+0, h_sroa_0_09 as i64
+  store bc2sa_phi_slot_iter_sroa_0_04_i_idx+0, 0 as i64
+  store bc2sa_phi_slot_j_sroa_0_07+0, r13 as i64
+  br exitcond_not_1 -> L_bb3_i, L_bb5
+
+@extern llvm_lifetime_start_p0(arg0: ptr)
+@extern llvm_lifetime_end_p0(arg0: ptr)
+@extern llvm_memset_p0_i64(arg0: ptr, arg1: i8, arg2: i64, arg3: i1)

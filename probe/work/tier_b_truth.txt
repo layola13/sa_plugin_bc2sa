@@ -1,0 +1,5 @@
+vec_sum(10) = 285
+vec_filter_sum(10) = 25
+string_build() = 7754
+string_fmt() = 4208
+string_split_count() = 519

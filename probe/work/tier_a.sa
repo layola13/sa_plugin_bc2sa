@@ -1,0 +1,175 @@
+@export area_code(tag: i32, a: f64, b: f64) -> f64:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 8
+  store bc2sa_phi_slot__0_sroa_0_0+0, -1 as f64
+  bc2sa_switch_cmp_0_0 = eq tag, 0
+  br bc2sa_switch_cmp_0_0 -> L_bb4, L_BC2SA_SWITCH_NEXT_0_0
+L_BC2SA_SWITCH_NEXT_0_0:
+  bc2sa_switch_cmp_0_1 = eq tag, 1
+  br bc2sa_switch_cmp_0_1 -> L_bb3, L_bb1
+L_bb4:
+  _6 = fmul a, 3.141592653589793
+  r0 = fmul a, _6
+  store bc2sa_phi_slot__0_sroa_0_0+0, r0 as f64
+  jmp L_bb1
+L_bb3:
+  r1 = fmul a, b
+  store bc2sa_phi_slot__0_sroa_0_0+0, r1 as f64
+  jmp L_bb1
+L_bb1:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as f64
+  return _0_sroa_0_0
+
+@export classify(n: i32) -> i32:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 4
+  _9 = slt n, -99
+  store bc2sa_phi_slot__0_sroa_0_0+0, -3 as i32
+  br _9 -> L_bb15, L_bb3
+L_bb3:
+  _7 = slt n, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, -1 as i32
+  br _7 -> L_bb15, L_bb5
+L_bb5:
+  r0 = eq n, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 0 as i32
+  br r0 -> L_bb15, L_bb6
+L_bb6:
+  _5 = ult n, 100
+  store bc2sa_phi_slot__0_sroa_0_0+0, 1 as i32
+  br _5 -> L_bb15, L_bb8
+L_bb15:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as i32
+  return _0_sroa_0_0
+L_bb8:
+  _3 = ult n, 1000
+  bc2sa_select_slot_r_ = stack_alloc 4
+  br _3 -> L_BC2SA_SELECT_TRUE_r_, L_BC2SA_SELECT_FALSE_r_
+L_BC2SA_SELECT_TRUE_r_:
+  store bc2sa_select_slot_r_+0, 2 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_FALSE_r_:
+  store bc2sa_select_slot_r_+0, 3 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_JOIN_r_:
+  r_ = load bc2sa_select_slot_r_+0 as i32
+  store bc2sa_phi_slot__0_sroa_0_0+0, r_ as i32
+  jmp L_bb15
+
+@export dist2(x1: i64, y1: i64, x2: i64, y2: i64) -> i64:
+L_start:
+  p = sub x2, x1
+  p1 = sub y2, y1
+  _7 = mul p, p
+  _8 = mul p1, p1
+  _0 = add _8, _7
+  return _0
+
+@export fib(n: i32) -> i64:
+L_start:
+  bc2sa_phi_slot_a_sroa_0_07_epil_init = stack_alloc 8
+  bc2sa_phi_slot_b_sroa_0_06_epil_init = stack_alloc 8
+  bc2sa_phi_slot_a_sroa_0_07_epil = stack_alloc 8
+  bc2sa_phi_slot_b_sroa_0_06_epil = stack_alloc 8
+  bc2sa_phi_slot_epil_iter = stack_alloc 4
+  bc2sa_phi_slot_a_sroa_0_0_lcssa = stack_alloc 8
+  bc2sa_phi_slot_a_sroa_0_07 = stack_alloc 8
+  bc2sa_phi_slot_b_sroa_0_06 = stack_alloc 8
+  bc2sa_phi_slot_niter = stack_alloc 4
+  _44_not = eq n, 0
+  store bc2sa_phi_slot_a_sroa_0_0_lcssa+0, 0 as i64
+  br _44_not -> L_bb3, L_bb2_preheader
+L_bb2_preheader:
+  xtraiter = and n, 7
+  r0 = ult n, 8
+  store bc2sa_phi_slot_a_sroa_0_07_epil_init+0, 0 as i64
+  store bc2sa_phi_slot_b_sroa_0_06_epil_init+0, 1 as i64
+  br r0 -> L_bb2_epil_preheader, L_bb2_preheader_new
+L_bb2_preheader_new:
+  unroll_iter = and n, -8
+  store bc2sa_phi_slot_a_sroa_0_07+0, 0 as i64
+  store bc2sa_phi_slot_b_sroa_0_06+0, 1 as i64
+  store bc2sa_phi_slot_niter+0, 0 as i32
+  jmp L_bb2
+L_bb3_loopexit_unr_lcssa:
+  lcmp_mod_not = eq xtraiter, 0
+  store bc2sa_phi_slot_a_sroa_0_07_epil_init+0, t_6 as i64
+  store bc2sa_phi_slot_b_sroa_0_06_epil_init+0, t_7 as i64
+  store bc2sa_phi_slot_a_sroa_0_0_lcssa+0, t_6 as i64
+  br lcmp_mod_not -> L_bb3, L_bb2_epil_preheader
+L_bb2_epil_preheader:
+  a_sroa_0_07_epil_init = load bc2sa_phi_slot_a_sroa_0_07_epil_init+0 as i64
+  b_sroa_0_06_epil_init = load bc2sa_phi_slot_b_sroa_0_06_epil_init+0 as i64
+  lcmp_mod9 = ne xtraiter, 0
+  call @llvm_assume(lcmp_mod9)
+  store bc2sa_phi_slot_a_sroa_0_07_epil+0, a_sroa_0_07_epil_init as i64
+  store bc2sa_phi_slot_b_sroa_0_06_epil+0, b_sroa_0_06_epil_init as i64
+  store bc2sa_phi_slot_epil_iter+0, 0 as i32
+  jmp L_bb2_epil
+L_bb2_epil:
+  a_sroa_0_07_epil = load bc2sa_phi_slot_a_sroa_0_07_epil+0 as i64
+  b_sroa_0_06_epil = load bc2sa_phi_slot_b_sroa_0_06_epil+0 as i64
+  epil_iter = load bc2sa_phi_slot_epil_iter+0 as i32
+  t_epil = add a_sroa_0_07_epil, b_sroa_0_06_epil
+  epil_iter_next = add epil_iter, 1
+  epil_iter_cmp_not = eq epil_iter_next, xtraiter
+  store bc2sa_phi_slot_a_sroa_0_07_epil+0, b_sroa_0_06_epil as i64
+  store bc2sa_phi_slot_b_sroa_0_06_epil+0, t_epil as i64
+  store bc2sa_phi_slot_epil_iter+0, epil_iter_next as i32
+  store bc2sa_phi_slot_a_sroa_0_0_lcssa+0, b_sroa_0_06_epil as i64
+  br epil_iter_cmp_not -> L_bb3, L_bb2_epil
+L_bb3:
+  a_sroa_0_0_lcssa = load bc2sa_phi_slot_a_sroa_0_0_lcssa+0 as i64
+  return a_sroa_0_0_lcssa
+L_bb2:
+  a_sroa_0_07 = load bc2sa_phi_slot_a_sroa_0_07+0 as i64
+  b_sroa_0_06 = load bc2sa_phi_slot_b_sroa_0_06+0 as i64
+  niter = load bc2sa_phi_slot_niter+0 as i32
+  t = add a_sroa_0_07, b_sroa_0_06
+  t_1 = add b_sroa_0_06, t
+  t_2 = add t, t_1
+  t_3 = add t_1, t_2
+  t_4 = add t_2, t_3
+  t_5 = add t_3, t_4
+  t_6 = add t_4, t_5
+  t_7 = add t_5, t_6
+  niter_next_7 = add niter, 8
+  niter_ncmp_7 = eq niter_next_7, unroll_iter
+  store bc2sa_phi_slot_a_sroa_0_07+0, t_6 as i64
+  store bc2sa_phi_slot_b_sroa_0_06+0, t_7 as i64
+  store bc2sa_phi_slot_niter+0, niter_next_7 as i32
+  br niter_ncmp_7 -> L_bb3_loopexit_unr_lcssa, L_bb2
+
+@export sign_chain(x: i32) -> i32:
+L_start:
+  bc2sa_phi_slot__0_sroa_0_0 = stack_alloc 4
+  _2 = sgt x, 10
+  store bc2sa_phi_slot__0_sroa_0_0+0, 2 as i32
+  br _2 -> L_bb12, L_bb2
+L_bb2:
+  _3 = sgt x, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 1 as i32
+  br _3 -> L_bb12, L_bb4
+L_bb4:
+  r0 = eq x, 0
+  store bc2sa_phi_slot__0_sroa_0_0+0, 0 as i32
+  br r0 -> L_bb12, L_bb6
+L_bb6:
+  _4 = ugt x, -10
+  bc2sa_select_slot_r_ = stack_alloc 4
+  br _4 -> L_BC2SA_SELECT_TRUE_r_, L_BC2SA_SELECT_FALSE_r_
+L_BC2SA_SELECT_TRUE_r_:
+  store bc2sa_select_slot_r_+0, -1 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_FALSE_r_:
+  store bc2sa_select_slot_r_+0, -2 as i32
+  jmp L_BC2SA_SELECT_JOIN_r_
+L_BC2SA_SELECT_JOIN_r_:
+  r_ = load bc2sa_select_slot_r_+0 as i32
+  store bc2sa_phi_slot__0_sroa_0_0+0, r_ as i32
+  jmp L_bb12
+L_bb12:
+  _0_sroa_0_0 = load bc2sa_phi_slot__0_sroa_0_0+0 as i32
+  return _0_sroa_0_0
+
+@extern llvm_assume(arg0: i1)
