@@ -628,6 +628,16 @@ fn appendReturn(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, 
     try out.append('\n');
 }
 
+fn intTypeBits(ty_text: []const u8) ?u32 {
+    const t = trim(ty_text);
+    if (std.mem.eql(u8, t, "i1")) return 1;
+    if (std.mem.eql(u8, t, "i8")) return 8;
+    if (std.mem.eql(u8, t, "i16")) return 16;
+    if (std.mem.eql(u8, t, "i32")) return 32;
+    if (std.mem.eql(u8, t, "i64")) return 64;
+    return null;
+}
+
 fn appendCast(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lhs: []const u8, op: []const u8, rest: []const u8) !void {
     const to_idx = std.mem.lastIndexOf(u8, rest, " to ") orelse return error.UnsupportedInstruction;
     const source = trim(rest[0..to_idx]);
@@ -636,6 +646,26 @@ fn appendCast(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, lh
     const dest_ty = typeTokenToSa(dest_ty_token) orelse return error.UnsupportedInstruction;
     const dst = try sanitizeIdent(allocator, lhs, "r");
     defer allocator.free(dst);
+    // zext is defined by LLVM on the *source type width*: the result is
+    // the low w bits of the source, zero-filled. SA registers are flat
+    // 64-bit slots and a sub-word `load ... as i8` sign-extends into the
+    // register, so a bare SA `zext` of that register propagates the sign
+    // bits instead of masking (measured: fnv1a_stream diverges from the
+    // native value at the first hashed byte >= 0x80; the sign-extended
+    // variant reproduces the wrong result bit-for-bit). Lower zext to an
+    // explicit mask, which is exact for every source-value producer.
+    if (std.mem.eql(u8, op, "zext")) {
+        const src_token = firstTypeToken(source) orelse return error.UnsupportedInstruction;
+        const src_bits = intTypeBits(src_token) orelse return error.UnsupportedInstruction;
+        const dst_bits = intTypeBits(dest_ty_token) orelse return error.UnsupportedInstruction;
+        if (src_bits < dst_bits and src_bits < 64) {
+            const mask: u64 = (@as(u64, 1) << @as(u6, @intCast(src_bits))) - 1;
+            try listPrint(out, "  {s} = and ", .{dst});
+            try appendValue(out, allocator, source);
+            try listPrint(out, ", {d}\n", .{mask});
+            return;
+        }
+    }
     try listPrint(out, "  {s} = {s} ", .{ dst, op });
     try appendValue(out, allocator, source);
     try listPrint(out, " as {s}\n", .{dest_ty});
@@ -2106,6 +2136,25 @@ test "bc2sa phi cross-block uses reload from slots (M1 and M2)" {
     try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "store bc2sa_xslot_t+0, t as i32"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "t = load bc2sa_xslot_t+0 as i32"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out1, 1, "store bc2sa_phi_slot_r+0, t as i32"));
+}
+
+test "bc2sa zext lowers to a source-width mask" {
+    // SA's flat registers let a sub-word load sign-extend into the full
+    // register; a bare zext then keeps the sign bits (fnv1a_stream byte
+    // >= 0x80 divergence). zext must mask to the source width.
+    const ir =
+        \\define i64 @zx(ptr %p) {
+        \\entry:
+        \\  %b = load i8, ptr %p, align 1
+        \\  %w = zext i8 %b to i64
+        \\  ret i64 %w
+        \\}
+        \\
+    ;
+    const out = try translateIrSource(std.testing.allocator, ir);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.containsAtLeast(u8, out, 1, "w = and b, 255"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, out, 1, "zext"));
 }
 
 test "bc2sa normalization rewrites the four dialect-drift classes" {
